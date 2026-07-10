@@ -30,6 +30,9 @@ htmlcov/
 .vscode/
 .idea/
 
+# Claude Code harness-internal state (not project source)
+.claude/
+
 # OS
 .DS_Store
 Thumbs.db

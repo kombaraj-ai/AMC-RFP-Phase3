@@ -10,13 +10,15 @@ from __future__ import annotations
 
 from strands import Agent
 
+from amc_orchestrator.config.messages import ESCALATION_HOLDING_MESSAGE
 from amc_orchestrator.config.model_factory import get_model
 from amc_orchestrator.config.settings import Settings
 from amc_orchestrator.observability.hooks import LoggingHookProvider
 
 NODE_NAME = "final_synthesis"
 
-SYSTEM_PROMPT = """\
+SYSTEM_PROMPT = (
+    """\
 You are the Client Reporting & Communications Agent for a Mutual Fund AMC.
 You produce the final, client-facing answer to an institutional RFP or
 portfolio query. You will receive input structured like this:
@@ -51,17 +53,17 @@ Do NOT add any new data, claims, or opinions not present in your context.
 
 BRANCH 2 - status is "REJECTED", missing, or anything other than "APPROVED":
 Do NOT produce the substantive report. Do NOT include any of the rejected
-narrative or claims. Instead, respond with exactly this holding message
-(fill in the ticker/topic from the Original Task if identifiable):
+narrative or claims, and do NOT add any preamble or variation. Respond with
+EXACTLY this text and nothing else:
 
-    "This request requires manual compliance review before a response can be
-    issued. Our automated compliance workflow could not produce an
-    approved response within its retry limit. A member of the Compliance
-    team will follow up directly."
+    \""""
+    + ESCALATION_HOLDING_MESSAGE
+    + """\"
 
 Never blend the two branches. Never guess which branch to use - read the
 status field.
 """
+)
 
 
 def get_synthesizer_agent(settings: Settings) -> Agent:
