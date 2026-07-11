@@ -12,7 +12,7 @@ import uuid
 import structlog
 
 from amc_orchestrator.config.settings import get_settings
-from amc_orchestrator.data import chroma_store, sqlite_store
+from amc_orchestrator.data import qual_store, quant_store
 from amc_orchestrator.observability.logging_setup import bind_trace_context, configure_logging
 from amc_orchestrator.workflows.graph_build import build_rfp_graph
 from amc_orchestrator.workflows.result_extraction import summarize_exception, summarize_result
@@ -21,10 +21,10 @@ logger = structlog.get_logger(__name__)
 
 
 def bootstrap_dev_data() -> None:
-    """Idempotently seed the local SQLite + Chroma stores."""
+    """Idempotently seed the active data backend (SQLite+Chroma, or DynamoDB+KB)."""
     settings = get_settings()
-    sqlite_store.ensure_seeded(settings.sqlite_full_path)
-    chroma_store.ensure_seeded(settings.chroma_full_path, settings.chroma_collection_name)
+    quant_store.ensure_seeded(settings)
+    qual_store.ensure_seeded(settings)
 
 
 def run_rfp_query(question: str) -> None:

@@ -52,12 +52,26 @@ class Settings(BaseSettings):
     model_temperature_worker: float = 0.2
     model_temperature_synthesis: float = 0.4
 
+    # --- Data backend selection ---
+    # Which data stores the app actually reads/writes, independent of `environment` -
+    # STAGING/PROD always use "aws" regardless of this setting (see
+    # `effective_data_backend`); DEV respects it, defaulting to "local" but allowing
+    # opt-in AWS testing against Phase 02's Terraform-provisioned DynamoDB table /
+    # Bedrock Knowledge Base before a full staging cutover.
+    data_backend: Literal["local", "aws"] = "local"
+
     # --- Quantitative data store ---
     sqlite_path: str = "local_dev.db"
+    # Populated from Terraform's `dynamodb_table_name` output; used when
+    # effective_data_backend == "aws".
+    dynamodb_table_name: str = ""
 
     # --- Qualitative data store ---
     chroma_persist_dir: str = "data/chroma"
     chroma_collection_name: str = "fund_manager_commentary"
+    # Populated from Terraform's `knowledge_base_id` output; used when
+    # effective_data_backend == "aws".
+    bedrock_knowledge_base_id: str = ""
 
     # --- Compliance self-correction loop ---
     max_compliance_attempts: int = 3
@@ -104,6 +118,19 @@ class Settings(BaseSettings):
         if self.environment != "dev":
             return "bedrock"
         return self.model_provider
+
+    @property
+    def effective_data_backend(self) -> Literal["local", "aws"]:
+        """Resolve the data backend actually used, applying the staging/prod override.
+
+        STAGING/PROD always use the AWS-backed stores (DynamoDB, Bedrock Knowledge
+        Base) regardless of `data_backend` - mirrors `effective_model_provider`'s
+        reasoning exactly. DEV respects `data_backend` as configured, so a given run
+        can opt into the real AWS resources without needing a separate environment.
+        """
+        if self.environment != "dev":
+            return "aws"
+        return self.data_backend
 
 
 @lru_cache

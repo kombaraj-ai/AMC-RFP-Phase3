@@ -159,6 +159,8 @@ name = "amc-orchestrator"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [
+    { name = "bedrock-agentcore" },
+    { name = "boto3" },
     { name = "chromadb" },
     { name = "fastapi" },
     { name = "pydantic" },
@@ -183,6 +185,8 @@ ui = [
 
 [package.metadata]
 requires-dist = [
+    { name = "bedrock-agentcore", specifier = ">=1.18.0" },
+    { name = "boto3", specifier = ">=1.34.0" },
     { name = "chromadb", specifier = ">=0.5.20" },
     { name = "fastapi", specifier = ">=0.115.0" },
     { name = "pydantic", specifier = ">=2.9.0" },
@@ -350,6 +354,25 @@ wheels = [
     { url = "https://files.pythonhosted.org/packages/c0/f6/688d2cd64bfd0b14d805ddb8a565e11ca1fb0fd6817175d58b10052b6d88/bcrypt-5.0.0-cp39-abi3-win32.whl", hash = "sha256:64d7ce196203e468c457c37ec22390f1a61c85c6f0b8160fd752940ccfb3a683", size = 153725, upload-time = "2025-09-25T19:50:34.384Z" },
     { url = "https://files.pythonhosted.org/packages/9f/b9/9d9a641194a730bda138b3dfe53f584d61c58cd5230e37566e83ec2ffa0d/bcrypt-5.0.0-cp39-abi3-win_amd64.whl", hash = "sha256:64ee8434b0da054d830fa8e89e1c8bf30061d539044a39524ff7dec90481e5c2", size = 150912, upload-time = "2025-09-25T19:50:35.69Z" },
     { url = "https://files.pythonhosted.org/packages/27/44/d2ef5e87509158ad2187f4dd0852df80695bb1ee0cfe0a684727b01a69e0/bcrypt-5.0.0-cp39-abi3-win_arm64.whl", hash = "sha256:f2347d3534e76bf50bca5500989d6c1d05ed64b440408057a37673282c654927", size = 144953, upload-time = "2025-09-25T19:50:37.32Z" },
+]
+
+[[package]]
+name = "bedrock-agentcore"
+version = "1.18.0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "boto3" },
+    { name = "botocore" },
+    { name = "pydantic" },
+    { name = "starlette" },
+    { name = "typing-extensions" },
+    { name = "urllib3" },
+    { name = "uvicorn" },
+    { name = "websockets" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/81/ff/de9c721ec4dd4cd0e03bf7d1a59c3f7c68273d59ba21884bcff1c0a4f455/bedrock_agentcore-1.18.0.tar.gz", hash = "sha256:ddaea72191632549d2f28faa5f37af3321a14715d7149d841107e9f91a27be96", size = 1030011, upload-time = "2026-07-10T18:24:16.506Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/03/d4/f7ea8f31084a2abe9aa874ccffe2dbf67a2c39a812598abeb7a8a784df8b/bedrock_agentcore-1.18.0-py3-none-any.whl", hash = "sha256:d1f6b8851b34ab51c0619caef02c0734b5cc0af6ede019673cc2f4dc231971c9", size = 450509, upload-time = "2026-07-10T18:24:14.927Z" },
 ]
 
 [[package]]

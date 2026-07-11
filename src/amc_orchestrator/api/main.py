@@ -15,7 +15,7 @@ from fastapi.middleware.cors import CORSMiddleware
 
 from amc_orchestrator.api.routes.rfp import router as rfp_router
 from amc_orchestrator.config.settings import get_settings
-from amc_orchestrator.data import chroma_store, sqlite_store
+from amc_orchestrator.data import qual_store, quant_store
 from amc_orchestrator.observability.logging_setup import configure_logging
 from amc_orchestrator.observability.readiness import check_readiness
 
@@ -23,8 +23,8 @@ from amc_orchestrator.observability.readiness import check_readiness
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
     settings = get_settings()
-    sqlite_store.ensure_seeded(settings.sqlite_full_path)
-    chroma_store.ensure_seeded(settings.chroma_full_path, settings.chroma_collection_name)
+    quant_store.ensure_seeded(settings)
+    qual_store.ensure_seeded(settings)
     yield
 
 

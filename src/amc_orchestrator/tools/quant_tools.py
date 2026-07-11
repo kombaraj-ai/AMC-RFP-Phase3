@@ -1,7 +1,8 @@
 """Strands tool wrappers around the quantitative data layer.
 
-Kept intentionally thin - all real logic lives in `data.sqlite_store` and is
-unit-tested there without any Strands/LLM dependency.
+Kept intentionally thin - all real logic lives in `data.sqlite_store`/
+`data.dynamodb_store` (dispatched via `data.quant_store`) and is unit-tested
+there without any Strands/LLM dependency.
 """
 
 from __future__ import annotations
@@ -11,7 +12,7 @@ import json
 from strands import tool
 
 from amc_orchestrator.config.settings import get_settings
-from amc_orchestrator.data import sqlite_store
+from amc_orchestrator.data import quant_store
 
 
 @tool
@@ -27,7 +28,7 @@ def get_fund_performance(ticker: str) -> str:
         ticker: The fund ticker symbol, e.g. "SMC3".
     """
     settings = get_settings()
-    row = sqlite_store.fetch_fund_performance(settings.sqlite_full_path, ticker)
+    row = quant_store.fetch_fund_performance(settings, ticker)
     if row is None:
         return json.dumps({"error": f"No performance data found for ticker '{ticker}'."})
     return json.dumps(row)

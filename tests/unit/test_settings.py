@@ -33,3 +33,29 @@ def test_staging_forces_bedrock_even_if_ollama_requested() -> None:
 def test_prod_forces_bedrock_even_if_ollama_requested() -> None:
     settings = Settings(environment="prod", model_provider="ollama")
     assert settings.effective_model_provider == "bedrock"
+
+
+# --- effective_data_backend ---------------------------------------------
+# Same shape as effective_model_provider above, for the same reason: DEV can
+# opt into the AWS-backed stores (DynamoDB/Bedrock Knowledge Base) per-run;
+# STAGING/PROD always use them regardless of `data_backend`.
+
+
+def test_dev_defaults_to_local_data_backend() -> None:
+    settings = Settings(environment="dev")
+    assert settings.effective_data_backend == "local"
+
+
+def test_dev_can_opt_into_aws_data_backend() -> None:
+    settings = Settings(environment="dev", data_backend="aws")
+    assert settings.effective_data_backend == "aws"
+
+
+def test_staging_forces_aws_data_backend_even_if_local_requested() -> None:
+    settings = Settings(environment="staging", data_backend="local")
+    assert settings.effective_data_backend == "aws"
+
+
+def test_prod_forces_aws_data_backend_even_if_local_requested() -> None:
+    settings = Settings(environment="prod", data_backend="local")
+    assert settings.effective_data_backend == "aws"

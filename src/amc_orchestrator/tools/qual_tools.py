@@ -1,6 +1,7 @@
 """Strands tool wrappers around the qualitative (RAG) data layer.
 
-Kept intentionally thin - all real logic lives in `data.chroma_store` and is
+Kept intentionally thin - all real logic lives in `data.chroma_store`/
+`data.knowledge_base_store` (dispatched via `data.qual_store`) and is
 unit-tested there without any Strands/LLM dependency.
 """
 
@@ -9,7 +10,7 @@ from __future__ import annotations
 from strands import tool
 
 from amc_orchestrator.config.settings import get_settings
-from amc_orchestrator.data import chroma_store
+from amc_orchestrator.data import qual_store
 
 
 @tool
@@ -25,9 +26,7 @@ def search_fund_commentary(query: str) -> str:
             e.g. "Alpha Prime Smallcap Direct Fund volatility explanation".
     """
     settings = get_settings()
-    results = chroma_store.search_commentary(
-        settings.chroma_full_path, settings.chroma_collection_name, query, n_results=2
-    )
+    results = qual_store.search_commentary(settings, query, n_results=2)
     if not results:
         return "No relevant fund manager commentary found for this query."
     return "\n\n".join(results)
