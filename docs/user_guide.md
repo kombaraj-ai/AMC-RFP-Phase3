@@ -3,9 +3,9 @@
 **AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV)**
 
 This is the practical, task-oriented companion to [`architecture.md`](architecture.md). It covers
-setup, running the system two ways (CLI and API), the mock data you can query against, and
-troubleshooting. Examples use `uv` and PowerShell, matching this project's actual dev environment
-(Windows, `uv`-managed Python).
+setup, running the system three ways (CLI, API, and a Streamlit UI), the mock data you can query
+against, and troubleshooting. Examples use `uv` and PowerShell, matching this project's actual dev
+environment (Windows, `uv`-managed Python).
 
 ## Prerequisites
 
@@ -106,6 +106,12 @@ works.
 - STAGING/PROD always use Bedrock regardless of `MODEL_PROVIDER` - that setting only ever
   changes behavior in DEV.
 
+**Confirmed working**: see
+[`sample_invocation_walkthrough.md`](sample_invocation_walkthrough.md) for a full node-by-node
+trace of a real `MODEL_PROVIDER=bedrock` run - completed in 11.64 seconds end-to-end (vs. 5-10+
+minutes on Ollama for the equivalent query), with the compliance agent invoking its
+structured-output tool natively on the first try.
+
 ## Mock fund data (DEV)
 
 Four funds are seeded automatically (idempotent — safe to re-run) the first time you run the CLI
@@ -187,13 +193,16 @@ curl.exe -i http://localhost:8000/health/ready
 
 ### `POST /api/v1/rfp`
 
-```powershell
-curl.exe -X POST http://localhost:8000/api/v1/rfp `
-  -H "Content-Type: application/json" `
-  -d '{\"question\": \"Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its current macroeconomic strategy.\"}'
+```bash
+curl.exe -X POST http://localhost:8000/api/v1/rfp \
+  -H "Content-Type: application/json" \
+  -d '{"question": "Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its current macroeconomic strategy."}'
 ```
 
-Or with PowerShell's native `Invoke-RestMethod` (handles JSON escaping for you):
+Note: this uses bash's `\` line continuation and unescaped double quotes inside single
+quotes (works in Git Bash / WSL). In native PowerShell, use `` ` `` for continuation and
+escape inner quotes as `\"` instead - or just use `Invoke-RestMethod` below, which sidesteps
+the quoting problem entirely:
 
 ```powershell
 Invoke-RestMethod -Method Post -Uri http://localhost:8000/api/v1/rfp `
@@ -223,6 +232,43 @@ empty `question` → `422`).
 
 A ready-to-import request collection (health/readiness checks + both scenarios above) is at
 [`postman/amc_orchestrator.postman_collection.json`](postman/amc_orchestrator.postman_collection.json).
+
+## Running via the Streamlit UI
+
+A browser front-end for the same `POST /api/v1/rfp` endpoint used above — no separate agent
+logic, no direct Ollama/Bedrock access; it's a thin HTTP client over the already-running API
+server, the same way `cli.py` is. **Start the API server first** (see
+[Running via the API](#running-via-the-api)); the UI has nothing to talk to otherwise.
+
+```powershell
+# One-time: pull in the UI's extra dependencies (Streamlit, on top of the base install)
+uv sync --group ui
+
+# Terminal 1 - the API server
+uv run python -m amc_orchestrator.main
+
+# Terminal 2 - the UI
+uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py
+```
+
+Opens at `http://localhost:8501`. What's in it:
+
+- **Sidebar** — API base URL (defaults to `http://localhost:8000`, editable if you're pointed at
+  a different host/port), a live API-online / readiness badge (calls `/health` and
+  `/health/ready`, same semantics as [above](#get-healthready)), a request-timeout slider (raise
+  this past the default 600s if you're on Ollama and a query is genuinely still running — see
+  [Troubleshooting](#troubleshooting)), and the mock fund reference table.
+- **Main panel** — a dropdown of example queries (one per mock fund, including the SMC3
+  high-risk/compliance-loop scenario), an editable question box, and a **Submit RFP** button.
+- **Result view** — an Approved/Escalated status badge, compliance-attempt count, elapsed time,
+  the rendered response text, and the raw `RfpOutcome` JSON in a collapsible expander.
+- **Session history** — every query submitted in the current browser session, newest first, so
+  you can compare outcomes across runs without re-submitting.
+
+No graph-failure handling is needed in the UI itself — the API route already guarantees a
+well-formed `RfpOutcome` on every call, escalation included (see
+[`POST /api/v1/rfp`](#post-apiv1rfp) above). The UI only surfaces network-level failures
+(API unreachable, request timeout) as user-facing error messages.
 
 ## Running the tests
 
