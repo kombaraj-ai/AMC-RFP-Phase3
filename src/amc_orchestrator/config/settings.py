@@ -30,11 +30,20 @@ class Settings(BaseSettings):
 
     environment: Literal["dev", "staging", "prod"] = "dev"
 
-    # --- Model provider (dev: Ollama) ---
+    # --- Model provider selection ---
+    # Which LLM actually generates responses, independent of `environment`:
+    # STAGING/PROD always use Bedrock regardless of this setting (see
+    # `effective_model_provider`); DEV respects it, defaulting to Ollama but
+    # allowing an opt-in to Bedrock for use cases where local CPU-only
+    # generation is too slow. Needs AWS credentials configured to actually
+    # work, and incurs real per-request cost even from DEV.
+    model_provider: Literal["ollama", "bedrock"] = "ollama"
+
+    # --- Model provider (Ollama; used when effective_model_provider == "ollama") ---
     ollama_host: str = "http://localhost:11434"
     ollama_model_id: str = "qwen2.5:7b-instruct"
 
-    # --- Model provider (staging/prod: Bedrock) ---
+    # --- Model provider (Bedrock; used when effective_model_provider == "bedrock") ---
     bedrock_model_id: str = "anthropic.claude-3-5-sonnet-20241022-v2:0"
     aws_region: str = "us-east-1"
 
@@ -84,8 +93,17 @@ class Settings(BaseSettings):
         return [origin.strip() for origin in self.cors_origins.split(",") if origin.strip()]
 
     @property
-    def is_local_llm(self) -> bool:
-        return self.environment == "dev"
+    def effective_model_provider(self) -> Literal["ollama", "bedrock"]:
+        """Resolve the model provider actually used, applying the staging/prod override.
+
+        STAGING/PROD always use Bedrock regardless of `model_provider` - a
+        compliance/production requirement, not a developer preference. DEV
+        respects `model_provider` as configured, so a given run can opt into
+        Bedrock without needing a separate environment.
+        """
+        if self.environment != "dev":
+            return "bedrock"
+        return self.model_provider
 
 
 @lru_cache

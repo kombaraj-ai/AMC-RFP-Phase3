@@ -73,3 +73,17 @@ def test_check_readiness_staging_skips_ollama_check(tmp_path: Path) -> None:
 
     assert "ollama_reachable" not in report.checks
     assert report.ready is True
+
+
+def test_check_readiness_dev_with_bedrock_provider_skips_ollama_check(tmp_path: Path) -> None:
+    settings = Settings(
+        environment="dev",
+        model_provider="bedrock",
+        sqlite_path=str(tmp_path / "local.db"),
+        chroma_persist_dir=str(tmp_path / "chroma"),
+    )
+
+    report = check_readiness(settings)
+
+    assert "ollama_reachable" not in report.checks
+    assert report.ready is True

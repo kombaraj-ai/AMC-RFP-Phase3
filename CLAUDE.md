@@ -15,15 +15,20 @@ calls, trusted for business rules/rubric/mock data):
 - **Package manager**: `uv` (src-layout package `src/amc_orchestrator/`)
 - **Agent framework**: `strands-agents` v1.47 (real PyPI package — see "API
   gotchas" below, a lot of hallucinated API calls exist in blog posts/docs)
-- **DEV LLM**: Ollama, `qwen2.5:7b-instruct` (chosen over llama3.2 for
-  reliable structured-output/tool-calling; already pulled locally)
+- **DEV LLM**: `MODEL_PROVIDER` env var, default `ollama` (`qwen2.5:7b-instruct`,
+  chosen over llama3.2 for reliable structured-output/tool-calling; already
+  pulled locally). Can opt into `bedrock` per-run instead (needs AWS
+  credentials, real cost) for use cases where local CPU-only generation is
+  too slow — see `Settings.effective_model_provider` in "Conventions"
+  below and `docs/user_guide.md`'s "Switching model provider" section.
 - **DEV data**: SQLite (`local_dev.db`, gitignored) for quant metrics,
   persistent on-disk ChromaDB (`data/chroma/`, gitignored) for qual RAG
-- **STAGING/PROD** (not built yet): swap to `BedrockModel` via
-  `config/model_factory.py` — zero agent-code changes required
+- **STAGING/PROD** (not built yet): always `BedrockModel` via
+  `config/model_factory.py` regardless of `MODEL_PROVIDER` — zero
+  agent-code changes required, only `ENVIRONMENT` + AWS credentials
 - **API**: FastAPI (`api/main.py` + `api/routes/rfp.py`, Milestone 8 - `POST
-  /api/v1/rfp`, `GET /health`; start via `uv run python -m amc_orchestrator.main`
-  or the `amc-orchestrator` console script)
+  /api/v1/rfp`, `GET /health`, `GET /health/ready`; start via `uv run python
+  -m amc_orchestrator.main` or the `amc-orchestrator` console script)
 - **Logging**: structlog, JSON or console renderer
 - **Tests**: pytest, `unit` (fast, no LLM) vs `integration` (marker
   `@pytest.mark.integration`, needs Ollama running, auto-skips if not)
@@ -187,14 +192,28 @@ known, root-caused DEV-only limitation (Ollama ignores `tool_choice` - see
 Bug #2 addendum). It's parked, not chased further. M7 (retry fix + hardened
 integration tests), M8 (FastAPI layer), M9 (docs), and M10 (hardening) are
 all done this session - all four are the last of the originally-planned 10
-milestones. **All 10 milestones are now checked off.** Natural next steps
-from here, none yet scoped: broader hardening (readiness when Bedrock/AWS
-creds are misconfigured in staging/prod, load testing), CI wiring (a GitHub
-Actions workflow was never set up - `uv run pytest tests/unit` is a natural
-fast gate, integration tests would need a hosted Ollama runner), or moving
-on to STAGING environment setup (`config/model_factory.py` should already
-support this with zero agent-code changes, per its own design, but that
-claim has never actually been exercised end-to-end against real Bedrock).
+milestones. **All 10 milestones are now checked off.**
+
+**Post-M10 addition (same session, 2026-07-11)**: DEV can now opt into
+Bedrock per-run instead of Ollama (`MODEL_PROVIDER=bedrock` +
+`Settings.effective_model_provider` - see "Conventions" below), for use
+cases where local CPU-only Ollama generation is too slow. This directly
+mitigates the Bug #2 flakiness for whoever opts in (Bedrock/Claude
+supports real `tool_choice` forcing), without waiting on a full STAGING
+environment. Unit-tested (`test_settings.py`, `test_model_factory.py`,
+`test_readiness.py`'s new dev+bedrock case) and live-smoke-tested
+(`/health/ready` confirmed to skip its Ollama check when
+`MODEL_PROVIDER=bedrock`); **not yet exercised against a real Bedrock
+call** (would need real AWS credentials, which weren't available this
+session) - if you have credentials, running the CLI once with
+`MODEL_PROVIDER=bedrock` set is the natural verification still owed here.
+
+Natural next steps from here, none yet scoped: broader hardening
+(readiness when Bedrock/AWS creds are misconfigured, load testing), CI
+wiring (a GitHub Actions workflow was never set up - `uv run pytest
+tests/unit` is a natural fast gate, integration tests would need a hosted
+Ollama runner or `MODEL_PROVIDER=bedrock` with CI-provisioned AWS
+credentials), or a full STAGING environment setup exercised end-to-end.
 
 ## Architecture (why it's built this way)
 
@@ -328,8 +347,18 @@ completion.
 - Every module reads config through `config.settings.get_settings()` —
   never `os.getenv` directly.
 - `config.model_factory.get_model()` is the *only* place that imports a
-  concrete model class — this is what makes DEV→STAGING/PROD a config
-  change, not a code change.
+  concrete model class — this is what makes switching provider (DEV's
+  Ollama/Bedrock toggle, or DEV→STAGING/PROD) a config change, not a code
+  change. **Provider selection is `Settings.model_provider`
+  (`"ollama"`/`"bedrock"`, default `"ollama"`), resolved through
+  `Settings.effective_model_provider`** — DEV respects `model_provider`
+  (so a run can opt into Bedrock without a separate environment, e.g. when
+  local Ollama generation is too slow for a given use case); STAGING/PROD
+  always force `"bedrock"` regardless of it. Never branch on `environment`
+  directly for provider decisions — always go through
+  `effective_model_provider` (see `observability/readiness.py` for the
+  other real consumer, which skips its Ollama-reachability check
+  accordingly).
 - Data-layer modules (`data/sqlite_store.py`, `data/chroma_store.py`) and
   tool wrappers (`tools/*.py`) are deliberately Strands-free/thin so they're
   unit-testable without an LLM.

@@ -42,11 +42,12 @@ Set any of these as environment variables or in `environments/.env.dev`:
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `ENVIRONMENT` | `dev` | `dev` \| `staging` \| `prod` — selects which `.env.<environment>` file loads and whether Ollama or Bedrock is used. |
-| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address (dev only). |
-| `OLLAMA_MODEL_ID` | `qwen2.5:7b-instruct` | Ollama model (dev only). |
-| `BEDROCK_MODEL_ID` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model (staging/prod only). |
-| `AWS_REGION` | `us-east-1` | Bedrock region (staging/prod only). |
+| `ENVIRONMENT` | `dev` | `dev` \| `staging` \| `prod` — selects which `.env.<environment>` file loads. |
+| `MODEL_PROVIDER` | `ollama` | `ollama` \| `bedrock` — which LLM generates responses. Only takes effect in DEV; STAGING/PROD always use Bedrock regardless of this setting. See [Switching model provider](#switching-model-provider-ollama-vs-bedrock) below. |
+| `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address. Used when the effective provider is Ollama. |
+| `OLLAMA_MODEL_ID` | `qwen2.5:7b-instruct` | Ollama model. Used when the effective provider is Ollama. |
+| `BEDROCK_MODEL_ID` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model. Used when the effective provider is Bedrock (always in staging/prod; opt-in in dev). |
+| `AWS_REGION` | `us-east-1` | Bedrock region. Used when the effective provider is Bedrock. |
 | `MODEL_TEMPERATURE_JUDGE` | `0.15` | `compliance_check` temperature. |
 | `MODEL_TEMPERATURE_WORKER` | `0.2` | `quant_data_pull`/`qual_narrative_pull`/`revise_draft` temperature. |
 | `MODEL_TEMPERATURE_SYNTHESIS` | `0.4` | `final_synthesis` temperature. |
@@ -62,6 +63,48 @@ Set any of these as environment variables or in `environments/.env.dev`:
 | `CORS_ORIGINS` | `*` | Comma-separated allowed origins. `*` is fine for localhost-only DEV; restrict in staging/prod. |
 | `LOG_LEVEL` | `DEBUG` | Standard logging level name. |
 | `LOG_FORMAT` | `json` | `json` (machine-readable) or `console` (human-friendly). `cli.py` forces `console` automatically in dev. |
+
+## Switching model provider (Ollama vs. Bedrock)
+
+DEV defaults to Ollama - free, fully local, no setup beyond [Prerequisites](#prerequisites) - but
+some use cases (long prompts, tighter latency needs, evaluating output quality) benefit from a
+faster, more capable model. Rather than requiring a separate STAGING environment for that, DEV
+can opt into Bedrock per-run via `MODEL_PROVIDER`, with zero code changes - see
+[`architecture.md`](architecture.md#model-provider-abstraction) for how the resolution logic
+works.
+
+**To use Bedrock from DEV:**
+
+1. Have AWS credentials available in your environment (e.g. `aws configure`, an SSO profile via
+   `aws sso login`, or `AWS_ACCESS_KEY_ID`/`AWS_SECRET_ACCESS_KEY` env vars) with Bedrock invoke
+   permissions for the model you choose, in the target region.
+2. Set in `environments/.env.dev` (or as process env vars):
+
+   ```powershell
+   $env:MODEL_PROVIDER = "bedrock"
+   $env:BEDROCK_MODEL_ID = "anthropic.claude-3-5-sonnet-20241022-v2:0"  # or another Bedrock model
+   $env:AWS_REGION = "us-east-1"
+   ```
+
+3. Run the CLI or API exactly as before - no other change needed:
+
+   ```powershell
+   uv run python -m amc_orchestrator.cli "Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its current macroeconomic strategy."
+   ```
+
+**Trade-offs to know before flipping this on:**
+
+- **Real cost, even from DEV.** Every agent turn is a billed Bedrock invocation. This is not a
+  free local sandbox anymore once `MODEL_PROVIDER=bedrock` is set.
+- **The `StructuredOutputException` flakiness on `compliance_check` (see
+  [Troubleshooting](#troubleshooting)) is an Ollama-specific limitation** - Bedrock's Claude
+  models support real `tool_choice` forcing, so this specific failure mode is expected to be
+  much rarer with `MODEL_PROVIDER=bedrock`.
+- `GET /health/ready` automatically stops checking Ollama reachability once Bedrock is the
+  active provider (checked via `effective_model_provider`, not just `ENVIRONMENT`) - it isn't
+  meaningful to ping a local port that isn't being used.
+- STAGING/PROD always use Bedrock regardless of `MODEL_PROVIDER` - that setting only ever
+  changes behavior in DEV.
 
 ## Mock fund data (DEV)
 

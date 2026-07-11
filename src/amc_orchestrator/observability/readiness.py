@@ -1,10 +1,11 @@
 """Operational readiness checks - can this process serve a request right now.
 
 Distinct from liveness (`GET /health`, "is the process alive"): readiness
-answers "can it currently reach the dependencies it needs" - Ollama in DEV,
-and the SQLite/Chroma data directories always - so an orchestrator can route
-traffic away from an instance whose LLM backend is unreachable instead of
-letting it return graph-invocation failures to clients.
+answers "can it currently reach the dependencies it needs" - Ollama, when it's
+the effective model provider, and the SQLite/Chroma data directories always -
+so an orchestrator can route traffic away from an instance whose LLM backend
+is unreachable instead of letting it return graph-invocation failures to
+clients.
 """
 
 from __future__ import annotations
@@ -44,10 +45,10 @@ class ReadinessReport:
 
 
 def check_readiness(settings: Settings) -> ReadinessReport:
-    """Run all readiness checks relevant to `settings.environment`."""
+    """Run all readiness checks relevant to `settings.effective_model_provider`."""
     checks: dict[str, bool] = {}
 
-    if settings.is_local_llm:
+    if settings.effective_model_provider == "ollama":
         checks["ollama_reachable"] = ollama_reachable(settings.ollama_host)
 
     checks["sqlite_dir_writable"] = _directory_writable(settings.sqlite_full_path.parent)

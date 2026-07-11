@@ -1,9 +1,10 @@
-"""Environment-driven model provider factory.
+"""Model provider factory, driven by `Settings.effective_model_provider`.
 
 This is the *only* module that imports a concrete Strands model class.
 Agents never import `OllamaModel`/`BedrockModel` directly - they call
-`get_model(settings, temperature=...)` - so promoting from DEV to
-STAGING/PROD is a config change, not a code change.
+`get_model(settings, temperature=...)` - so switching provider (DEV's
+Ollama/Bedrock toggle, or promoting to STAGING/PROD) is a config change,
+not a code change.
 """
 
 from __future__ import annotations
@@ -14,8 +15,8 @@ from amc_orchestrator.config.settings import Settings
 
 
 def get_model(settings: Settings, *, temperature: float) -> Model:
-    """Return the model provider appropriate for `settings.environment`."""
-    if settings.is_local_llm:
+    """Return the model provider appropriate for `settings.effective_model_provider`."""
+    if settings.effective_model_provider == "ollama":
         from strands.models.ollama import OllamaModel
 
         return OllamaModel(

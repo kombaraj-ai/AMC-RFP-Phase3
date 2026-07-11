@@ -200,14 +200,33 @@ real logic stays unit-tested at the data-layer level.
 
 ```python
 def get_model(settings: Settings, *, temperature: float) -> Model:
-    if settings.is_local_llm:            # environment == "dev"
+    if settings.effective_model_provider == "ollama":
         return OllamaModel(host=settings.ollama_host, model_id=settings.ollama_model_id, temperature=temperature)
     return BedrockModel(model_id=settings.bedrock_model_id, region_name=settings.aws_region, temperature=temperature)
 ```
 
 Every agent constructor calls `get_model(settings, temperature=...)` and never imports
-`OllamaModel`/`BedrockModel` directly, so promoting DEV → STAGING/PROD is a config change
-(`ENVIRONMENT=staging` + AWS credentials), not a code change to any agent.
+`OllamaModel`/`BedrockModel` directly, so switching provider is always a config change, never a
+code change to any agent.
+
+**Provider selection is a separate axis from `environment`.** `Settings.model_provider`
+(`"ollama"` | `"bedrock"`, default `"ollama"`) is the developer-facing switch; `environment`
+still selects which `.env.<environment>` file loads. `Settings.effective_model_provider`
+resolves the two:
+
+```python
+@property
+def effective_model_provider(self) -> Literal["ollama", "bedrock"]:
+    if self.environment != "dev":
+        return "bedrock"          # STAGING/PROD: compliance requirement, not a preference
+    return self.model_provider    # DEV: respects the developer's choice
+```
+
+DEV defaults to Ollama (free, fully local) but can opt into Bedrock per-run
+(`MODEL_PROVIDER=bedrock` + AWS credentials) for use cases where CPU-only local generation is
+too slow - without needing a separate environment or any code change. STAGING/PROD always use
+Bedrock regardless of `model_provider`, since that constraint is about where the system is
+deployed, not a runtime preference. See [`user_guide.md`](user_guide.md) for how to switch it.
 
 ## Observability
 
@@ -237,9 +256,11 @@ request/response shapes and examples.
 
 `GET /health` only answers "is the process alive" — it always returns 200. `GET /health/ready`
 (`observability/readiness.py`) answers the more useful operational question, "can this process
-currently serve a request": in DEV, whether Ollama is reachable over TCP
-(`settings.ollama_host`); in every environment, whether the SQLite/Chroma data directories are
-writable. It returns `200 {"ready": true, ...}` when every check passes, `503 {"ready": false,
+currently serve a request": whether Ollama is reachable over TCP
+(`settings.ollama_host`) **only when `effective_model_provider == "ollama"`** — this check is
+skipped entirely when Bedrock is the active provider, in DEV or otherwise, since pinging a local
+Ollama port would be meaningless there; and in every environment, whether the SQLite/Chroma data
+directories are writable. It returns `200 {"ready": true, ...}` when every check passes, `503 {"ready": false,
 ...}` otherwise — an orchestrator should route traffic away from an instance failing readiness,
 distinct from `/health`, which should keep reporting the process itself is fine. The Ollama
 reachability check is also reused (not duplicated) by
