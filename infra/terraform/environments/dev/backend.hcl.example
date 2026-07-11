@@ -1,0 +1,9 @@
+# Copy to backend.hcl (gitignored) and fill in with bootstrap's outputs:
+#   terraform -chdir=infra/terraform/bootstrap output state_bucket_name
+#   terraform -chdir=infra/terraform/bootstrap output state_bucket_region
+#
+# Then: terraform init -backend-config=backend.hcl
+
+bucket = "amc-orchestrator-tfstate-<account-id>"
+key    = "dev/terraform.tfstate"
+region = "us-east-1"

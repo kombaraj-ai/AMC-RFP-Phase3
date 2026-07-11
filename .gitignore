@@ -37,3 +37,15 @@ htmlcov/
 .DS_Store
 Thumbs.db
 
+# Terraform
+# .terraform.lock.hcl is intentionally NOT ignored - it's a dependency
+# lockfile (like package-lock.json) and should be committed per root module.
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+backend.hcl
+crash.log
+crash.*.log
+infra/terraform/modules/lambda-tools/.build/
+

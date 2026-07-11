@@ -1,0 +1,6 @@
+# Copy to backend.hcl (gitignored) and fill in with bootstrap's outputs.
+# Then: terraform init -backend-config=backend.hcl
+
+bucket = "amc-orchestrator-tfstate-<account-id>"
+key    = "staging/terraform.tfstate"
+region = "us-east-1"

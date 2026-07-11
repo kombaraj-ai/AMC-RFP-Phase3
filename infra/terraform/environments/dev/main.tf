@@ -1,0 +1,169 @@
+# Composition order matters here - see each module's own comments for why.
+# Rough shape: independent leaf resources first (dynamodb/ecr/s3/opensearch
+# collection) -> iam (needs their ARNs) -> the access policy that needed iam
+# and opensearch flipped the other way -> lambda-tools -> the two
+# phase-gated modules (knowledge base, agent runtime) -> observability.
+
+module "dynamodb" {
+  source = "../../modules/dynamodb"
+
+  name_prefix                    = local.name_prefix
+  point_in_time_recovery_enabled = var.dynamodb_point_in_time_recovery
+  deletion_protection_enabled    = var.dynamodb_deletion_protection
+  use_cmk                        = var.use_cmk
+  tags                           = local.common_tags
+}
+
+module "ecr" {
+  source = "../../modules/ecr"
+
+  name_prefix                = local.name_prefix
+  untagged_image_expiry_days = var.ecr_untagged_image_expiry_days
+  max_tagged_images          = var.ecr_max_tagged_images
+  tags                       = local.common_tags
+}
+
+module "s3_kb_docs" {
+  source = "../../modules/s3-kb-docs"
+
+  name_prefix = local.name_prefix
+  account_id  = data.aws_caller_identity.current.account_id
+  use_cmk     = var.use_cmk
+  tags        = local.common_tags
+}
+
+module "opensearch_serverless" {
+  source = "../../modules/opensearch-serverless"
+
+  name_prefix      = local.name_prefix
+  use_cmk          = var.use_cmk
+  standby_replicas = var.opensearch_standby_replicas
+  tags             = local.common_tags
+}
+
+module "iam" {
+  source = "../../modules/iam"
+
+  name_prefix                       = local.name_prefix
+  aws_region                        = var.aws_region
+  account_id                        = data.aws_caller_identity.current.account_id
+  dynamodb_table_arn                = module.dynamodb.table_arn
+  opensearch_collection_arn         = module.opensearch_serverless.collection_arn
+  kb_docs_bucket_arn                = module.s3_kb_docs.bucket_arn
+  ecr_repository_arn                = module.ecr.repository_arn
+  bedrock_model_arns                = local.bedrock_model_arns
+  lambda_tool_names                 = var.lambda_tool_names
+  additional_data_access_principals = var.additional_data_access_principals
+  tags                              = local.common_tags
+}
+
+module "opensearch_access_policy" {
+  source = "../../modules/opensearch-access-policy"
+
+  collection_name = module.opensearch_serverless.collection_name
+  principal_arns  = module.iam.data_access_principal_arns
+  tags            = local.common_tags
+}
+
+module "lambda_tools" {
+  source = "../../modules/lambda-tools"
+
+  name_prefix                    = local.name_prefix
+  tool_names                     = var.lambda_tool_names
+  lambda_execution_role_arn      = module.iam.lambda_execution_role_arn
+  dynamodb_table_name            = module.dynamodb.table_name
+  opensearch_collection_endpoint = module.opensearch_serverless.collection_endpoint
+  log_retention_days             = var.log_retention_days
+  tags                           = local.common_tags
+
+  depends_on = [module.opensearch_access_policy]
+}
+
+# --- Phase 2: vector index + knowledge base (see var.enable_knowledge_base) -
+module "opensearch_index" {
+  source = "../../modules/opensearch-index"
+  count  = var.enable_knowledge_base ? 1 : 0
+
+  providers = {
+    opensearch = opensearch
+  }
+
+  embedding_dimension = 1024
+
+  depends_on = [module.opensearch_access_policy]
+}
+
+module "knowledge_base" {
+  source = "../../modules/knowledge-base"
+  count  = var.enable_knowledge_base ? 1 : 0
+
+  name_prefix               = local.name_prefix
+  aws_region                = var.aws_region
+  knowledge_base_role_arn   = module.iam.knowledge_base_role_arn
+  docs_bucket_arn           = module.s3_kb_docs.bucket_arn
+  opensearch_collection_arn = module.opensearch_serverless.collection_arn
+  embedding_model           = var.embedding_model
+  tags                      = local.common_tags
+
+  depends_on = [module.opensearch_index]
+}
+
+# --- Phase 3: agent runtime (see var.enable_agent_runtime) ----------------
+module "agentcore_memory" {
+  source = "../../modules/agentcore-memory"
+
+  name_prefix       = local.name_prefix
+  event_expiry_days = var.memory_event_expiry_days
+  use_cmk           = var.use_cmk
+  tags              = local.common_tags
+}
+
+module "agentcore_gateway" {
+  source = "../../modules/agentcore-gateway"
+
+  name_prefix      = local.name_prefix
+  gateway_role_arn = module.iam.gateway_role_arn
+  tags             = local.common_tags
+
+  lambda_tools = {
+    for name, arn in module.lambda_tools.function_arns :
+    name => {
+      lambda_arn  = arn
+      description = "AMC ${name} tool (Terraform-provisioned placeholder - see modules/lambda-tools)"
+    }
+  }
+}
+
+module "agentcore_runtime" {
+  source = "../../modules/agentcore-runtime"
+  count  = var.enable_agent_runtime ? 1 : 0
+
+  name_prefix         = local.name_prefix
+  runtime_role_arn    = module.iam.runtime_role_arn
+  container_image_uri = var.container_image_uri
+  protocol            = var.runtime_protocol
+  tags                = local.common_tags
+
+  environment_variables = {
+    ENVIRONMENT                    = var.environment
+    DYNAMODB_TABLE_NAME            = module.dynamodb.table_name
+    OPENSEARCH_COLLECTION_ENDPOINT = module.opensearch_serverless.collection_endpoint
+    BEDROCK_KNOWLEDGE_BASE_ID      = var.enable_knowledge_base ? module.knowledge_base[0].knowledge_base_id : ""
+    GATEWAY_URL                    = module.agentcore_gateway.gateway_url
+    MEMORY_ID                      = module.agentcore_memory.memory_id
+    BEDROCK_MODEL_ID               = var.bedrock_model_id
+    AWS_REGION                     = var.aws_region
+  }
+}
+
+module "observability" {
+  source = "../../modules/observability"
+
+  name_prefix           = local.name_prefix
+  aws_region            = var.aws_region
+  dynamodb_table_name   = module.dynamodb.table_name
+  lambda_function_names = values(module.lambda_tools.function_names)
+  alarm_email           = var.alarm_email
+  log_retention_days    = var.log_retention_days
+  tags                  = local.common_tags
+}
