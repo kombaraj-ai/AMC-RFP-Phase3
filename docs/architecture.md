@@ -226,11 +226,24 @@ Every agent constructor calls `get_model(settings, temperature=...)` and never i
 
 `api/main.py` builds the FastAPI app via `create_app()`: `lifespan` (not the deprecated
 `@app.on_event`) seeds SQLite/Chroma on startup, CORS is read from
-`settings.cors_origin_list`, and `GET /health` reports liveness. `api/routes/rfp.py` exposes
-`POST /api/v1/rfp`, applying the **exact same** try/except → `summarize_exception()` pattern as
-`cli.py` — this is deliberate, not incidental: without it, a flaky `compliance_check` would
-surface to HTTP callers as an unhandled 500 instead of the intended graceful escalation. See
-[`user_guide.md`](user_guide.md) for request/response shapes and examples.
+`settings.cors_origin_list`, `GET /health` reports liveness, and `GET /health/ready` reports
+readiness (see below). `api/routes/rfp.py` exposes `POST /api/v1/rfp`, applying the **exact
+same** try/except → `summarize_exception()` pattern as `cli.py` — this is deliberate, not
+incidental: without it, a flaky `compliance_check` would surface to HTTP callers as an unhandled
+500 instead of the intended graceful escalation. See [`user_guide.md`](user_guide.md) for
+request/response shapes and examples.
+
+### Readiness vs. liveness (Milestone 10)
+
+`GET /health` only answers "is the process alive" — it always returns 200. `GET /health/ready`
+(`observability/readiness.py`) answers the more useful operational question, "can this process
+currently serve a request": in DEV, whether Ollama is reachable over TCP
+(`settings.ollama_host`); in every environment, whether the SQLite/Chroma data directories are
+writable. It returns `200 {"ready": true, ...}` when every check passes, `503 {"ready": false,
+...}` otherwise — an orchestrator should route traffic away from an instance failing readiness,
+distinct from `/health`, which should keep reporting the process itself is fine. The Ollama
+reachability check is also reused (not duplicated) by
+`tests/integration/conftest.py` to auto-skip integration tests when Ollama isn't up.
 
 ## Result translation (`workflows/result_extraction.py`)
 
@@ -275,11 +288,12 @@ src/amc_orchestrator/
 │   ├── quant_agent.py  qual_agent.py  compliance_agent.py  revisor_agent.py  synthesizer_agent.py
 ├── observability/
 │   ├── logging_setup.py  hooks.py
+│   └── readiness.py                # check_readiness() — GET /health/ready backing logic
 ├── workflows/
 │   ├── routing.py                 # needs_revision / ready_to_synthesize condition functions
 │   ├── graph_build.py             # build_rfp_graph(settings)
 │   └── result_extraction.py       # RfpOutcome, summarize_result, summarize_exception
 └── api/
-    ├── main.py                    # create_app(), lifespan, CORS, /health
+    ├── main.py                    # create_app(), lifespan, CORS, /health, /health/ready
     └── routes/rfp.py              # POST /api/v1/rfp
 ```

@@ -17,6 +17,7 @@ from strands.types.exceptions import StructuredOutputException
 
 from amc_orchestrator.api.main import create_app
 from amc_orchestrator.config.messages import ESCALATION_HOLDING_MESSAGE
+from amc_orchestrator.observability.readiness import ReadinessReport
 
 
 def _fake_graph_result(*, synthesis_text: str, compliance_status: str) -> SimpleNamespace:
@@ -41,6 +42,26 @@ def test_health() -> None:
     response = client.get("/health")
     assert response.status_code == 200
     assert response.json()["status"] == "ok"
+
+
+def test_readiness_returns_200_when_ready() -> None:
+    ready_report = ReadinessReport(ready=True, checks={"ollama_reachable": True})
+    with patch("amc_orchestrator.api.main.check_readiness", return_value=ready_report):
+        client = TestClient(create_app())
+        response = client.get("/health/ready")
+
+    assert response.status_code == 200
+    assert response.json() == {"ready": True, "checks": {"ollama_reachable": True}}
+
+
+def test_readiness_returns_503_when_not_ready() -> None:
+    not_ready_report = ReadinessReport(ready=False, checks={"ollama_reachable": False})
+    with patch("amc_orchestrator.api.main.check_readiness", return_value=not_ready_report):
+        client = TestClient(create_app())
+        response = client.get("/health/ready")
+
+    assert response.status_code == 503
+    assert response.json() == {"ready": False, "checks": {"ollama_reachable": False}}
 
 
 def test_rfp_returns_compliant_completion() -> None:

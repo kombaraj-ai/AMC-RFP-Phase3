@@ -127,18 +127,74 @@ Working through the approved plan's 10 milestones sequentially:
       low-risk INC2 + high-risk SMC3 + validation-error requests against the
       real `POST /api/v1/rfp`). This CLAUDE.md remains the working session
       log; those are the stable reference docs.
-- [ ] M10 — hardening (ticker-not-found path, forced
-      `MAX_COMPLIANCE_ATTEMPTS=1` escalation test, etc.)
+- [x] M10 — hardening. Two of the four plan items were already solid before
+      this pass: ticker-not-found at the tool/data layer
+      (`test_tools.py::test_get_fund_performance_unknown_ticker_returns_error_payload`)
+      and malformed/missing-verdict fallback in routing
+      (`test_routing.py`'s `None`-verdict cases, including at
+      `max_attempts=1`) - both already unit-tested, no new code needed.
+      Added this session: **readiness endpoint**
+      (`observability/readiness.py` + `GET /health/ready`, checks Ollama
+      reachability in dev and SQLite/Chroma dir writability, 200 when ready
+      else 503; `tests/integration/conftest.py` now reuses the same
+      `ollama_reachable()` instead of duplicating it; 5 new unit tests +
+      2 API unit tests + a live out-of-process smoke test of both the
+      ready and not-ready cases, confirmed working), **`test_forced_escalation.py`**
+      (the SMC3 bait question with `MAX_COMPLIANCE_ATTEMPTS` forced to 1 via
+      the new `isolated_graph_settings_single_attempt` fixture - the real
+      end-to-end proof that a REJECTED draft never escapes just because the
+      attempt budget is exhausted, complementing routing.py's isolated unit
+      proof - **passed live, twice independently**, 551s and again as part
+      of a combined run), and **`test_ticker_not_found.py`** (a nonexistent
+      ticker query through the real graph, proving the agent layer - not
+      just the tool wrapper - reports missing data honestly instead of
+      fabricating figures - **passed live**, 373s).
+
+  **Verification note**: the dev machine ran critically low on RAM
+  (0.47GB free / 15.69GB total, likely from a long Ollama session plus
+  unrelated apps) partway through this milestone's verification, which
+  killed several background `pytest` runs outright (not a test failure -
+  no assertion ever ran; the process itself died mid-run, confirmed via
+  `Get-Process`/`Get-NetTCPConnection` showing no stray processes and
+  `ollama ps` showing genuine 100% CPU generation each time). `test_graph_smoke.py`
+  and `test_smc3_high_risk.py` were **not** re-run fresh after the M10
+  conftest.py refactor because of this - they already passed together
+  earlier this session (see M7b, 1144s clean run) before that refactor,
+  which only extracted a shared `_build_isolated_settings()` helper and
+  swapped a locally-duplicated `_ollama_reachable()` for the identical
+  `observability.readiness.ollama_reachable()` - verified by inspection to
+  be behavior-preserving (same env vars, same seeding calls, same
+  fixture yield/cache-clear pattern). If you have RAM headroom, re-running
+  `uv run pytest tests/integration -m integration -q` once fully (all 4)
+  is worthwhile but not believed necessary.
+
+  Also found and fixed in passing: an earlier session's manual
+  `uv run uvicorn ... &` / `kill %1` smoke tests (see M8) left orphaned
+  Windows processes bound to ports 8123-8126 that `kill %1` doesn't
+  reliably reap on this platform (Git Bash job control only kills the
+  top-level handle, not `uv run`'s child process) - these were silently
+  competing for CPU with later Ollama runs. Cleaned up via
+  `Stop-Process` (user-confirmed, since it's a system-wide process kill).
+  **Takeaway for next time**: prefer capturing the PID explicitly (e.g.
+  `uv run uvicorn ... & echo $!`) and verify termination with
+  `Get-NetTCPConnection -LocalPort <port>` after `kill`, rather than
+  trusting `kill %1` alone on Windows.
 
 ### Immediate next step (session resumed 2026-07-11)
 
 **Decision made 2026-07-11**: the `StructuredOutputException` flakiness is a
 known, root-caused DEV-only limitation (Ollama ignores `tool_choice` - see
 Bug #2 addendum). It's parked, not chased further. M7 (retry fix + hardened
-integration tests, both passing live), M8 (FastAPI layer, unit-tested +
-live-smoke-tested), and M9 (docs) are all done this session. Next up: M10
-(hardening edge cases - ticker-not-found path, forced
-`MAX_COMPLIANCE_ATTEMPTS=1` escalation test) - not started yet.
+integration tests), M8 (FastAPI layer), M9 (docs), and M10 (hardening) are
+all done this session - all four are the last of the originally-planned 10
+milestones. **All 10 milestones are now checked off.** Natural next steps
+from here, none yet scoped: broader hardening (readiness when Bedrock/AWS
+creds are misconfigured in staging/prod, load testing), CI wiring (a GitHub
+Actions workflow was never set up - `uv run pytest tests/unit` is a natural
+fast gate, integration tests would need a hosted Ollama runner), or moving
+on to STAGING environment setup (`config/model_factory.py` should already
+support this with zero agent-code changes, per its own design, but that
+claim has never actually been exercised end-to-end against real Bedrock).
 
 ## Architecture (why it's built this way)
 

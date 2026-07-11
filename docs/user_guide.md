@@ -116,12 +116,30 @@ By default this serves on `http://0.0.0.0:8000`. Interactive OpenAPI docs are at
 
 ### `GET /health`
 
+Liveness only - always returns 200 if the process is up, regardless of dependency state.
+
 ```powershell
 curl.exe http://localhost:8000/health
 ```
 
 ```json
 {"status": "ok", "environment": "dev"}
+```
+
+### `GET /health/ready`
+
+Readiness - checks whether the process can actually serve a request right now: Ollama
+reachability (dev only; skipped in staging/prod, which use Bedrock instead) and that the
+SQLite/Chroma data directories are writable. Returns `200` when ready, **`503`** when not - use
+this (not `/health`) behind a load balancer or orchestrator so traffic isn't routed to an
+instance whose LLM backend is down.
+
+```powershell
+curl.exe -i http://localhost:8000/health/ready
+```
+
+```json
+{"ready": true, "checks": {"ollama_reachable": true, "sqlite_dir_writable": true, "chroma_dir_writable": true}}
 ```
 
 ### `POST /api/v1/rfp`
@@ -160,7 +178,7 @@ is a 200 response either way, by design: an escalation is a valid, well-formed o
 server error. A request only ever returns a non-2xx status for genuine client errors (e.g. an
 empty `question` → `422`).
 
-A ready-to-import request collection (health check + both scenarios above) is at
+A ready-to-import request collection (health/readiness checks + both scenarios above) is at
 [`postman/amc_orchestrator.postman_collection.json`](postman/amc_orchestrator.postman_collection.json).
 
 ## Running the tests
@@ -169,9 +187,16 @@ A ready-to-import request collection (health check + both scenarios above) is at
 # Fast, deterministic, no LLM required — should always be green
 uv run pytest tests/unit -q
 
-# Slow (5-25+ min combined), needs Ollama reachable; auto-skips per-test if it isn't
+# Slow (30-45+ min combined across all 4 scenarios), needs Ollama reachable;
+# auto-skips per-test if it isn't
 uv run pytest tests/integration -m integration -q
 ```
+
+The integration suite covers four end-to-end scenarios against a real Ollama instance: a
+low-risk completion, the SMC3 compliance-loop trigger, a forced single-attempt escalation proof
+(`MAX_COMPLIANCE_ATTEMPTS=1`), and an unseeded-ticker honesty check — see
+[`architecture.md`](architecture.md) and each test's module docstring for what specifically each
+one proves.
 
 ## Troubleshooting
 

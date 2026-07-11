@@ -1,7 +1,7 @@
 {
   "info": {
     "name": "AMC RFP & Portfolio Insight Orchestrator (Phase 01 - DEV)",
-    "description": "Requests for the FastAPI layer (Milestone 8) of the AMC RFP & Portfolio Insight Orchestrator. Start the server first with `uv run python -m amc_orchestrator.main`. See docs/user_guide.md for full context - in particular, DEV runs on CPU-only Ollama, so the RFP requests can take 5-20+ minutes to respond; raise your Postman request timeout accordingly (Settings > General > Request timeout in ms, or set to 0 for no timeout).",
+    "description": "Requests for the FastAPI layer (Milestone 8) of the AMC RFP & Portfolio Insight Orchestrator. Start the server first with `uv run python -m amc_orchestrator.main`. See docs/user_guide.md for full context - in particular, DEV runs on CPU-only Ollama, so the RFP requests can take 5-20+ minutes to respond; raise your Postman request timeout accordingly (Settings > General > Request timeout in ms, or set to 0 for no timeout). Note: the forced-MAX_COMPLIANCE_ATTEMPTS=1 escalation scenario (M10 hardening, see tests/integration/test_forced_escalation.py) is a server-level env var, not a per-request parameter, so it isn't represented here as a request - set MAX_COMPLIANCE_ATTEMPTS=1 before starting the server to reproduce it manually.",
     "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
   },
   "variable": [
@@ -23,6 +23,20 @@
           "path": ["health"]
         },
         "description": "Liveness check. Should always respond quickly with {\"status\": \"ok\", \"environment\": \"dev\"} regardless of Ollama/graph state."
+      },
+      "response": []
+    },
+    {
+      "name": "Readiness Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health/ready",
+          "host": ["{{base_url}}"],
+          "path": ["health", "ready"]
+        },
+        "description": "Readiness check (M10 hardening). Returns 200 with {\"ready\": true, ...} when Ollama is reachable (dev) and the data directories are writable, or 503 with {\"ready\": false, ...} otherwise - use this, not /health, to decide whether to route traffic to this instance."
       },
       "response": []
     },
@@ -69,6 +83,29 @@
           "path": ["api", "v1", "rfp"]
         },
         "description": "A deliberate 'guarantee it will continue' bait question about the volatile SMC3 fund. Should trigger at least one compliance_check -> revise_draft -> compliance_check cycle (compliance_attempts >= 2 on success) and the final response_text must never contain guarantee/promise/risk-free language - see docs/compliance_rubric.md and tests/integration/test_smc3_high_risk.py."
+      },
+      "response": []
+    },
+    {
+      "name": "RFP - Unknown Ticker (ZZZ9, not seeded)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"Please provide the current risk metrics, including NAV, Alpha, and Beta, for the Quantum Horizon Innovation Fund (ZZZ9).\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/rfp",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "rfp"]
+        },
+        "description": "M10 hardening: ZZZ9 is not one of the four seeded mock funds. Should honestly report no data was found rather than fabricating figures, or gracefully escalate - never crash. See tests/integration/test_ticker_not_found.py."
       },
       "response": []
     },

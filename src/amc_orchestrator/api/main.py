@@ -10,13 +10,14 @@ from __future__ import annotations
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 
-from fastapi import FastAPI
+from fastapi import FastAPI, Response
 from fastapi.middleware.cors import CORSMiddleware
 
 from amc_orchestrator.api.routes.rfp import router as rfp_router
 from amc_orchestrator.config.settings import get_settings
 from amc_orchestrator.data import chroma_store, sqlite_store
 from amc_orchestrator.observability.logging_setup import configure_logging
+from amc_orchestrator.observability.readiness import check_readiness
 
 
 @asynccontextmanager
@@ -50,6 +51,13 @@ def create_app() -> FastAPI:
     @app.get("/health", tags=["health"])
     def health() -> dict[str, str]:
         return {"status": "ok", "environment": settings.environment}
+
+    @app.get("/health/ready", tags=["health"])
+    def readiness(response: Response) -> dict[str, object]:
+        report = check_readiness(settings)
+        if not report.ready:
+            response.status_code = 503
+        return {"ready": report.ready, "checks": report.checks}
 
     return app
 
