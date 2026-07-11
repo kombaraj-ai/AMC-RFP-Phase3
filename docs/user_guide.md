@@ -1,11 +1,12 @@
 # User Guide
 
-**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV)**
+**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment)**
 
 This is the practical, task-oriented companion to [`architecture.md`](architecture.md). It covers
 setup, running the system three ways (CLI, API, and a Streamlit UI), the mock data you can query
-against, and troubleshooting. Examples use `uv` and PowerShell, matching this project's actual dev
-environment (Windows, `uv`-managed Python).
+against, troubleshooting, and (as of Phase 02) deploying the AWS infrastructure via Terraform.
+Examples use `uv` and PowerShell, matching this project's actual dev environment (Windows,
+`uv`-managed Python).
 
 ## Prerequisites
 
@@ -286,6 +287,71 @@ low-risk completion, the SMC3 compliance-loop trigger, a forced single-attempt e
 (`MAX_COMPLIANCE_ATTEMPTS=1`), and an unseeded-ticker honesty check — see
 [`architecture.md`](architecture.md) and each test's module docstring for what specifically each
 one proves.
+
+## Deploying to AWS (Phase 02)
+
+Phase 02 provisions the AWS infrastructure for running this system on Amazon Bedrock AgentCore
+(Runtime, Gateway, Memory, DynamoDB, OpenSearch Serverless + Bedrock Knowledge Base, Lambda,
+IAM) via modular Terraform, one root module per environment, plus (as of the app-code follow-on
+task) an AgentCore-compliant entrypoint, a DynamoDB/Bedrock-Knowledge-Base data-layer swap, and a
+`Dockerfile` to actually build the image the Runtime needs.
+
+Full instructions, the three-pass apply flow, and known gotchas (why `PUBLIC` network mode is
+required, why the vector index needs a second pass, the settings mapping the entrypoint now
+consumes) live in [`infra/terraform/README.md`](../infra/terraform/README.md) — this
+section is just the map, not the territory:
+
+```powershell
+# One-time, per AWS account: the Terraform state backend
+cd infra/terraform/bootstrap
+terraform init; terraform apply
+
+# Per environment (dev/staging/prod), pass 1 of 3 - see the README for passes 2 and 3
+cd ../environments/dev
+cp backend.hcl.example backend.hcl   # fill in from bootstrap's output
+terraform init -backend-config="backend.hcl"
+terraform apply
+```
+
+Requires Terraform v1.15.7, AWS credentials for the target account, and Bedrock model access
+already granted for the chosen model/embedding model (an account-level opt-in, not something
+Terraform provisions). See [`CLAUDE.md`](../CLAUDE.md)'s "Phase 02" section for the locked-in
+architecture decisions (network mode, database choice, auth model) and why each one was made.
+
+### Testing the AgentCore Runtime entrypoint locally (no Docker/AWS needed)
+
+`runtime_entrypoint.py` implements the exact HTTP contract AgentCore Runtime expects, so you can
+smoke-test it as a plain local process before ever building an image:
+
+```powershell
+uv run python -m uvicorn amc_orchestrator.runtime_entrypoint:app --host 127.0.0.1 --port 8099
+```
+
+Then, in another terminal:
+
+```powershell
+curl http://127.0.0.1:8099/ping
+curl -X POST http://127.0.0.1:8099/invocations -H "Content-Type: application/json" `
+  -d '{\"prompt\": \"Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its macroeconomic strategy.\"}'
+```
+
+Uses whatever `Settings.effective_data_backend` resolves to just like the CLI/API do — `local`
+(SQLite/Chroma) by default in DEV, or `aws` (DynamoDB/Knowledge Base) if you've set
+`DATA_BACKEND=aws` plus `DYNAMODB_TABLE_NAME`/`BEDROCK_KNOWLEDGE_BASE_ID` from Phase 02's
+Terraform outputs.
+
+### Building and pushing the container image (pass 3)
+
+```powershell
+docker build --platform linux/arm64 -t <ecr_repository_url>:v1 .
+aws ecr get-login-password --region <region> | docker login --username AWS --password-stdin <ecr_repository_url>
+docker push <ecr_repository_url>:v1
+```
+
+Must be `linux/arm64` — AgentCore Runtime runs on Graviton, not optional. `<ecr_repository_url>`
+is pass 1's `ecr_repository_url` Terraform output. Once pushed, set
+`enable_agent_runtime = true` and `container_image_uri` in `terraform.tfvars` and apply — see
+`infra/terraform/README.md`'s "Pass 3" section.
 
 ## Troubleshooting
 

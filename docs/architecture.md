@@ -1,11 +1,12 @@
 # Architecture
 
-**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV)**
+**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment)**
 
-This document describes the system as actually implemented in `src/amc_orchestrator/`. For
-day-to-day operational notes (how to resume work, known flakiness, milestone status), see
-[`CLAUDE.md`](../CLAUDE.md) at the repo root — that file is a working log; this one is the
-stable reference.
+This document describes the system as actually implemented in `src/amc_orchestrator/` (Phase 01)
+and the AWS infrastructure that runs it in the cloud, as actually implemented in
+`infra/terraform/` (Phase 02). For day-to-day operational notes (how to resume work, known
+flakiness, milestone status), see [`CLAUDE.md`](../CLAUDE.md) at the repo root — that file is a
+working log; this one is the stable reference.
 
 ## The problem
 
@@ -286,20 +287,135 @@ class RfpOutcome:
 builds the safe-escalation equivalent when `graph(...)` raised outright. Both `cli.py` and
 `api/routes/rfp.py` call whichever applies and never touch Strands-internal types directly.
 
+## Phase 02 — AWS deployment infrastructure
+
+Everything above describes the application as it runs today (DEV, local-first). Phase 02 adds
+the AWS infrastructure to run it on **Amazon Bedrock AgentCore** instead — provisioned entirely
+by modular Terraform under `infra/terraform/`, one root module per environment
+(`environments/{dev,staging,prod}/`), zero manual console steps. Full operational detail (exact
+apply commands, variable reference, troubleshooting) lives in
+[`infra/terraform/README.md`](../infra/terraform/README.md); this section covers the shape of it
+and why it's built this way, in the same spirit as the rest of this document.
+
+**This phase is infra-only.** It provisions AWS resources; it does not change any code under
+`src/amc_orchestrator/`. The app still runs exactly as described above (SQLite/Chroma,
+`sqlite_store.py`/`chroma_store.py`) until a separate, not-yet-started follow-on task builds an
+AgentCore-compliant entrypoint, swaps the data layer to the resources below, and containerizes
+the app for ECR.
+
+### What gets provisioned
+
+| Concern | Resource(s) | Module |
+|---|---|---|
+| Agent execution | `aws_bedrockagentcore_agent_runtime` (container-based, `PUBLIC` network mode) | `agentcore-runtime` |
+| Tool exposure | `aws_bedrockagentcore_gateway` + one `gateway_target` per tool, IAM-auth'd | `agentcore-gateway` |
+| Conversation memory | `aws_bedrockagentcore_memory` + a semantic strategy scoped per session | `agentcore-memory` |
+| Quant metrics | DynamoDB, `PAY_PER_REQUEST`, `ticker` as the sole key — mirrors `sqlite_store.py`'s schema | `dynamodb` |
+| Qual vector store | OpenSearch Serverless collection (`VECTORSEARCH`) + its security/access policies | `opensearch-serverless`, `opensearch-access-policy` |
+| Qual RAG | Bedrock Knowledge Base + S3 data source, backed by the collection above | `knowledge-base`, `s3-kb-docs` |
+| Tool compute | Stub Lambda functions behind the Gateway targets (placeholder logic — see below) | `lambda-tools` |
+| Container registry | ECR repo for the runtime's image (Terraform never builds/pushes into it) | `ecr` |
+| Access control | One IAM role per AWS-service consumer (runtime, gateway, lambda, knowledge base) | `iam` |
+| Observability | Log groups, a CloudWatch dashboard, Lambda-error/DynamoDB-throttle alarms | `observability` |
+
+### Three architectural decisions worth knowing before touching this code
+
+1. **`PUBLIC` network mode, not `VPC`.** `aws_bedrockagentcore_agent_runtime` in `VPC` mode
+   creates ENIs that AWS locks with an "agentic_ai" owner and never releases, so
+   `terraform destroy` hangs forever on the resulting VPC/subnet/ENI cycle — a confirmed,
+   AWS-side, "not planned" limitation
+   ([terraform-provider-aws#45099](https://github.com/hashicorp/terraform-provider-aws/issues/45099)),
+   not something a smarter Terraform config can route around. Every module here uses `PUBLIC`
+   instead; access to DynamoDB/OpenSearch is scoped by IAM and the OpenSearch data-access policy,
+   not network isolation. This mirrors how `effective_model_provider` elsewhere in this system
+   is a deliberate, documented trade-off rather than an unexamined default — see "Model provider
+   abstraction" above for the same pattern applied to a different decision.
+2. **The vector index is created by a second Terraform provider, in a second apply pass.**
+   `hashicorp/aws` has no resource for an OpenSearch Serverless *index* (only the collection and
+   its policies) — confirmed against AWS's own Terraform deployment walkthrough for OpenSearch
+   Serverless, which stops at the collection. `modules/opensearch-index` uses the
+   `opensearch-project/opensearch` community provider instead, signed specifically for AOSS
+   (`aws_signature_service = "aoss"`, not the provider's `"es"` default), against the collection's
+   real endpoint — which only exists after a first apply. `modules/knowledge-base` depends on that
+   index existing too (the Bedrock Knowledge Base resource references it by name, it doesn't
+   create it). Both are gated behind `enable_knowledge_base` (default `false`) for exactly this
+   reason — see the README's "three phases" section.
+3. **`modules/iam` and the OpenSearch data-access policy would otherwise form a cycle.** IAM's
+   role policies need the collection's ARN to scope their `aoss:*` statements; the collection's
+   data-access policy needs those same roles' ARNs as its `Principal` list. Resolved by splitting
+   the access policy into its own `modules/opensearch-access-policy`, applied after both `iam` and
+   `opensearch-serverless` — a deliberate module boundary, not an accident of ordering.
+
+### The app-code follow-on: AgentCore entrypoint + DynamoDB/Knowledge Base data layer
+
+The gap called out above — no entrypoint, no Dockerfile, no cloud-backed data layer — is closed.
+Scope was deliberately kept smaller than it could have been: agents still call
+`get_fund_performance`/`search_fund_commentary` as regular in-process `@tool` functions, exactly
+as in Phase 01, just repointed at DynamoDB/a Bedrock Knowledge Base instead of SQLite/Chroma.
+
+- **`config/settings.py`**: `data_backend`/`effective_data_backend` mirror
+  `model_provider`/`effective_model_provider` exactly (see "Model provider abstraction" above) —
+  DEV can opt in, STAGING/PROD always resolve to `"aws"`.
+- **`data/dynamodb_store.py`** — same `ensure_seeded`/`fetch_fund_performance` shape as
+  `sqlite_store.py`, converting DynamoDB's `Decimal` to `float` before returning so
+  `tools/quant_tools.py`'s `json.dumps(row)` keeps working unchanged.
+- **`data/knowledge_base_store.py`** — calls Bedrock's managed `Retrieve` API against the
+  Knowledge Base Terraform already provisions, rather than hand-rolling raw OpenSearch k-NN
+  queries plus our own embedding calls; the KB resource exists specifically to do that
+  end-to-end. `ensure_seeded` here is a deliberate no-op (KB ingestion is an S3-upload +
+  `start_ingestion_job` operation, not safe to run implicitly on every app startup).
+- **`data/quant_store.py`/`data/qual_store.py`** — thin facades dispatching on
+  `effective_data_backend`, the only place that chooses between the local and AWS store. Only 4
+  existing files were touched to call the facade instead of the concrete store directly
+  (`tools/quant_tools.py`, `tools/qual_tools.py`, `cli.py`, `api/main.py`) —
+  `sqlite_store.py`/`chroma_store.py` themselves are untouched.
+- **`runtime_entrypoint.py`** — `bedrock_agentcore.runtime.BedrockAgentCoreApp`,
+  `@app.entrypoint` reading `payload["prompt"]`, reusing `build_rfp_graph` and
+  `summarize_result`/`summarize_exception` exactly as `cli.py`/`api/routes/rfp.py` already do — no
+  new translation logic, the same never-crash resilience contract. Implements the HTTP contract
+  AgentCore Runtime requires (`POST /invocations`, `GET /ping`), confirmed against Strands' own
+  AgentCore deployment guide.
+- **`Dockerfile`** (repo root) — `linux/arm64` (AgentCore Runtime runs on Graviton, not optional),
+  `uv`-based. No `environments/.env.*` file is baked into the image — Terraform's
+  `agent_runtime_artifact.environment_variables` sets real process environment variables
+  directly, and `Settings` reads those with no env file needed.
+
+**Confirmed working end-to-end, not just unit-tested**: a real local `uv run python -m uvicorn
+amc_orchestrator.runtime_entrypoint:app` smoke test — `GET /ping` healthy, a missing-`prompt`
+payload correctly rejected, and one real `POST /invocations` call against real Ollama actually
+completing (`succeeded=true`, a real compliant synthesized report). `docker build --platform
+linux/arm64` itself was not verified in that session (Docker Desktop's daemon wasn't running) —
+flagged as unverified rather than assumed working; worth doing before trusting the image builds.
+
+### What's still a placeholder
+
+`modules/lambda-tools` creates real, invokable Lambda functions wired into the Gateway, but their
+handler code is still a trivial stub (`return {"status": "not_implemented", ...}`) — real
+Gateway-routed tool logic and wiring AgentCore Memory into the graph (so conversation state
+persists cross-turn) were explicitly deferred, a separate and larger follow-on, not part of the
+work described just above. `aws_bedrockagentcore_agent_runtime` itself is still gated behind
+`enable_agent_runtime` (default `false`) until a real image built from the new `Dockerfile` is
+pushed to the ECR repo `modules/ecr` creates — Terraform deliberately never runs `docker build`.
+
 ## Repository map
 
 ```
 src/amc_orchestrator/
 ├── main.py                        # amc-orchestrator console script → uvicorn launcher
 ├── cli.py                         # direct graph invocation (pre-API smoke testing)
+├── runtime_entrypoint.py          # AgentCore Runtime entrypoint (BedrockAgentCoreApp, /invocations, /ping)
 ├── config/
 │   ├── settings.py                # Settings(BaseSettings), get_settings() cached singleton
 │   ├── model_factory.py           # get_model() — only place that imports OllamaModel/BedrockModel
 │   ├── compliance_rubric.py       # single source of truth for the rubric text
 │   └── messages.py                # ESCALATION_HOLDING_MESSAGE, shared safe-fallback text
 ├── data/
-│   ├── sqlite_store.py            # quant data (SQLite dev, Snowflake/Redshift-shaped staging+)
-│   └── chroma_store.py            # qual data (persistent Chroma dev, OpenSearch-shaped staging+)
+│   ├── sqlite_store.py            # quant data (SQLite, DEV local backend)
+│   ├── dynamodb_store.py          # quant data (DynamoDB, aws backend)
+│   ├── quant_store.py             # facade: dispatches sqlite_store vs dynamodb_store
+│   ├── chroma_store.py            # qual data (persistent Chroma, DEV local backend)
+│   ├── knowledge_base_store.py    # qual data (Bedrock Knowledge Base Retrieve API, aws backend)
+│   └── qual_store.py              # facade: dispatches chroma_store vs knowledge_base_store
 ├── tools/
 │   ├── quant_tools.py             # @tool get_fund_performance
 │   └── qual_tools.py              # @tool search_fund_commentary
@@ -317,4 +433,22 @@ src/amc_orchestrator/
 └── api/
     ├── main.py                    # create_app(), lifespan, CORS, /health, /health/ready
     └── routes/rfp.py              # POST /api/v1/rfp
+```
+
+`Dockerfile` lives at the repo root (sibling to `src/`, `infra/`) — builds the image
+`runtime_entrypoint.py` runs inside, pushed to the ECR repo `infra/terraform/modules/ecr` creates.
+
+```
+infra/terraform/
+├── bootstrap/                     # one-time: S3 state bucket, its own local state
+├── modules/                       # reusable, environment-agnostic (see table above)
+│   ├── iam/  ecr/  s3-kb-docs/  dynamodb/
+│   ├── opensearch-serverless/  opensearch-access-policy/  opensearch-index/
+│   ├── knowledge-base/  lambda-tools/
+│   ├── agentcore-memory/  agentcore-gateway/  agentcore-runtime/
+│   └── observability/
+└── environments/
+    ├── dev/       # cheapest defaults: no CMKs, single-AZ OpenSearch, short retention
+    ├── staging/   # mirrors prod's security posture (CMKs, HA) for pre-prod validation
+    └── prod/      # full HA + longest retention + deletion protection everywhere
 ```

@@ -203,10 +203,17 @@ supports real `tool_choice` forcing), without waiting on a full STAGING
 environment. Unit-tested (`test_settings.py`, `test_model_factory.py`,
 `test_readiness.py`'s new dev+bedrock case) and live-smoke-tested
 (`/health/ready` confirmed to skip its Ollama check when
-`MODEL_PROVIDER=bedrock`); **not yet exercised against a real Bedrock
-call** (would need real AWS credentials, which weren't available this
-session) - if you have credentials, running the CLI once with
-`MODEL_PROVIDER=bedrock` set is the natural verification still owed here.
+`MODEL_PROVIDER=bedrock`).
+
+**Verified against real Bedrock, 2026-07-11**: the user ran the CLI with
+`MODEL_PROVIDER=bedrock` (`anthropic.claude-3-5-sonnet-20241022-v2:0`,
+`us-east-1`) against the INC2 low-risk query - `graph_status=completed`,
+`compliance_attempts=1`, `escalated=False`, **11.64 seconds total**
+(vs. 5-10+ minutes on Ollama). `compliance_check` returned
+`stop_reason=tool_use` - Claude invoked `ComplianceVerdict` natively, no
+forced-retry needed at all, confirming the Bug #2 root-cause fix in
+practice, not just in theory. Full node-by-node trace, timing table, and
+analysis: [`docs/sample_invocation_walkthrough.md`](docs/sample_invocation_walkthrough.md).
 
 Natural next steps from here, none yet scoped: broader hardening
 (readiness when Bedrock/AWS creds are misconfigured, load testing), CI
@@ -367,3 +374,209 @@ completion.
   habit.
 - Git commits are one per milestone with a consistent message style — check
   `git log` for the pattern before committing new work.
+
+## Phase 02 — Deployment to Amazon Bedrock AgentCore
+
+Started 2026-07-11, session in progress (not yet committed to git as of the
+last session - see "Uncommitted work" below). Full detail:
+`infra/terraform/README.md` (infra) and `docs/architecture.md`'s "Phase 02"
+section (app-code). Plan file (currently holds the app-code follow-on
+plan, the most recent of two plans this phase used - the original
+Terraform-only plan's content lives on in this log, not in that file):
+`C:\Users\komba\.claude\plans\calm-sprouting-nebula.md`.
+
+### Current status (as of last session, 2026-07-11)
+
+- [x] Terraform (`infra/terraform/`) - all modules written, `fmt`/`validate`
+      clean on all 3 environments.
+- [x] Bootstrap (state bucket) applied to real AWS.
+- [x] Dev pass 1 (`enable_knowledge_base=false`, `enable_agent_runtime=false`)
+      applied to real AWS and **live-verified** resource-by-resource (not
+      just `terraform state list`) - IAM, ECR, DynamoDB, OpenSearch
+      collection, S3, both Lambda stubs (real `invoke`), Gateway + targets
+      (`READY`), Memory + strategy (`ACTIVE`), CloudWatch dashboard/alarms.
+      Two real bugs found via live AWS checks and fixed: OpenSearch
+      name-length overflow, double-prefixed CloudWatch alarm names.
+- [x] App-code follow-on task (entrypoint, DynamoDB/Knowledge-Base data-layer
+      swap, Dockerfile) - written and verified: 64 unit tests pass, a real
+      local `uvicorn` + real Ollama end-to-end `/invocations` call
+      succeeded.
+- [ ] **Not done**: `docker build` itself (Docker Desktop's daemon wasn't
+      running last session), pushing an image to ECR, `enable_agent_runtime
+      = true` + apply (the actual invokable Runtime), pass 2
+      (`enable_knowledge_base = true` - vector index + real Bedrock
+      Knowledge Base), staging/prod applies, real document ingestion into
+      the Knowledge Base, and the deliberately-deferred Gateway-routed
+      tools / AgentCore Memory graph integration.
+
+### Immediate next step (resume here)
+
+1. Start Docker Desktop, then `docker build --platform linux/arm64 -t
+   <ecr_repository_url>:v1 .` from the repo root (`ecr_repository_url` is
+   dev pass 1's Terraform output) - **not yet verified this session**, do
+   this first since everything after it depends on a working image.
+2. `docker push` that image, then in `infra/terraform/environments/dev/`:
+   set `enable_agent_runtime = true` and `container_image_uri` in
+   `terraform.tfvars`, `terraform apply` - the first real, invokable
+   AgentCore Runtime. Confirm with the user first (real AWS action), don't
+   auto-run.
+3. Separately (order-independent from #1/#2): pass 2 -
+   `enable_knowledge_base = true` (after adding the applier's principal to
+   `additional_data_access_principals`), apply - creates the vector index
+   + Knowledge Base. Real document ingestion (S3 upload +
+   `start_ingestion_job`) is a further, separate step after that.
+4. **Uncommitted work**: `git status` shows ~30 changed/new files from
+   this phase, not yet committed (Phase 01's convention is one commit per
+   milestone - worth committing in logical chunks - e.g. Terraform infra,
+   then the app-code follow-on - rather than one giant commit, but wasn't
+   asked to do so yet this session).
+
+Provisions every AWS resource the deployed system needs (AgentCore
+Runtime/Gateway/Memory, ECR, DynamoDB, OpenSearch Serverless + Bedrock
+Knowledge Base, Lambda tool stubs, IAM, observability) via modular
+Terraform (`infra/terraform/`), one root module per environment
+(`environments/{dev,staging,prod}/`), Terraform v1.15.7. Confirmed all
+required resource types exist natively in `hashicorp/aws` (no
+CloudFormation/awscc needed) by reading the provider's actual source docs,
+following this project's own M0 precedent of verifying against real
+sources instead of guessing from blog posts.
+
+**Scope is Terraform/infra only.** The app-code changes needed to actually
+run in AgentCore — an AgentCore-compliant HTTP entrypoint, swapping
+`data/sqlite_store.py`/`data/chroma_store.py` for DynamoDB/OpenSearch, a
+real Dockerfile — are a separate, not-yet-started follow-on task. This
+also means the `.env.staging.example`/`.env.prod.example` comments
+guessing "Snowflake/Redshift" and "Amazon OpenSearch" as the eventual
+data-layer swap target are now stale/wrong — the actual target is
+DynamoDB + OpenSearch Serverless, fixed in those files as part of this
+milestone.
+
+**Locked-in architecture decisions** (see `infra/terraform/README.md` for
+the full reasoning on each):
+- Single AWS account; dev/staging/prod isolated by naming + separate
+  Terraform state, not separate AWS accounts.
+- AgentCore Runtime network mode `PUBLIC`, not `VPC` — `VPC` mode hits a
+  confirmed open AWS bug (ENIs get locked, `terraform destroy` hangs
+  forever; `terraform-provider-aws` issue #45099, closed "not planned").
+- DynamoDB (pay-per-request) replaces SQLite for quant metrics.
+- Gateway/Runtime auth is AWS IAM (SigV4), not Cognito/JWT.
+- `aws_bedrockagentcore_agent_runtime` needs a container image that
+  doesn't exist yet at infra-build time — Terraform creates the ECR repo
+  only; the runtime resource is applied in a documented later pass once an
+  image is pushed out-of-band. Terraform never runs `docker build`.
+- OpenSearch Serverless has no native Terraform vector-index resource in
+  `hashicorp/aws` (confirmed against AWS's own "Deploy Amazon OpenSearch
+  Serverless with Terraform" blog, which stops at collection+policies) —
+  index creation uses the `opensearch-project/opensearch` community
+  provider instead, signed for AOSS specifically
+  (`aws_signature_service = "aoss"`, not its "es" default).
+- A dependency cycle surfaced during build: `modules/iam` needs the
+  OpenSearch collection's ARN to scope its role policies, but the
+  collection's data-access policy needs those same roles' ARNs as its
+  `Principal` list. Fixed by splitting the data-access policy into its own
+  `modules/opensearch-access-policy`, applied after both `modules/iam` and
+  `modules/opensearch-serverless` — worth knowing before "simplifying" the
+  module list back down.
+- Every environment applies in up to three passes (`enable_knowledge_base`
+  and `enable_agent_runtime` variables, both default `false`) because a
+  handful of resources genuinely can't exist before their prerequisites
+  do — see `infra/terraform/README.md`'s "three phases" section before
+  assuming a single `terraform apply` should create everything.
+
+**Verified so far**: `terraform fmt -recursive -check` clean and
+`terraform validate` (no AWS credentials needed) passes on `bootstrap/`
+and all three `environments/*` root modules — confirms every resource
+argument used against the real provider schema (provider resolved to
+`hashicorp/aws` v6.54.0, `opensearch-project/opensearch` v2.3.2,
+`hashicorp/archive` v2.8.0).
+
+**Real `terraform plan` run against the user's AWS account (dev, pass 1),
+2026-07-11**: 21 resources planned to add, 0 to change/destroy — the
+overall graph and module wiring is sound. Caught one real bug `validate`
+couldn't: `aws_opensearchserverless_collection`/`_security_policy`/
+`_access_policy` names are capped at 32 characters by AWS, and
+`amc-orchestrator-dev-kb-vectors` plus the `-enc`/`-net`/`-data` policy
+suffixes exceeded it (35-36 chars). Fixed in
+`modules/opensearch-serverless/main.tf`: `collection_name` is now built
+with a guaranteed-safe budget (27 chars, leaving room for the longest
+`-data` suffix) and a short suffix (`-vec` not `-kb-vectors`); if
+`name_prefix` is long enough that this would still overflow (e.g.
+`staging`'s longer name), a 6-char hash of the untruncated name is
+appended rather than naively `substr()`-truncating — a naive truncation
+risks two environments colliding if truncation cuts off the exact part
+that made them different. Re-`validate`d clean after the fix; **not yet
+re-`plan`ned** against real AWS to confirm this specific error is fully
+resolved (the next natural verification step, before applying for real).
+
+**Pass 1 applied to real AWS (dev), 2026-07-11 - fully live-verified, not
+just planned**: IAM roles (trust policies confirmed correctly scoped per
+service principal), ECR (empty, scan-on-push on), DynamoDB (`ACTIVE`,
+`PAY_PER_REQUEST`), OpenSearch Serverless collection (`ACTIVE`, name fits
+the 32-char limit after the fix above), S3 docs bucket, both Lambda tool
+stubs (real `invoke` calls returned the expected placeholder JSON),
+AgentCore Gateway + both targets (`READY`), AgentCore Memory + semantic
+strategy (`ACTIVE`), CloudWatch dashboard/alarms - all confirmed via live
+`aws`/`boto3` calls against the account, not just `terraform state list`.
+Found and fixed one more real bug this way: the two Lambda-error alarms
+were double-prefixed (`modules/observability/main.tf` re-prepending
+`name_prefix` onto `each.value`, which was already the fully-prefixed
+Lambda function name) - `terraform plan` after the fix showed exactly
+`2 to add, 0 to change, 2 to destroy`, applied clean.
+
+**App-code follow-on task done, 2026-07-11** (the work this unblocked):
+an AgentCore Runtime entrypoint, a DynamoDB/Bedrock-Knowledge-Base data-layer
+swap, and a Dockerfile - closing the gap that had `enable_agent_runtime`
+gated off. Scope deliberately kept smaller than it could have been (user
+confirmed): agents still call `get_fund_performance`/`search_fund_commentary`
+as regular in-process `@tool` functions, just repointed at DynamoDB/a
+Bedrock Knowledge Base instead of SQLite/Chroma - the Gateway's Lambda
+targets stay placeholders and AgentCore Memory stays unused by the graph,
+both a separate, larger follow-on.
+
+- `config/settings.py`: `data_backend`/`effective_data_backend` added,
+  mirroring `model_provider`/`effective_model_provider` exactly (DEV can
+  opt in, STAGING/PROD always use `"aws"`).
+- New `data/dynamodb_store.py`, `data/knowledge_base_store.py` (calls
+  Bedrock's managed `Retrieve` API against the Knowledge Base Terraform
+  already built, not hand-rolled OpenSearch k-NN + our own embedding
+  calls), and thin dispatch facades `data/quant_store.py`/`data/qual_store.py`
+  - only 4 existing files touched to call the facade instead of the
+  concrete store (`tools/quant_tools.py`, `tools/qual_tools.py`, `cli.py`,
+  `api/main.py`); `sqlite_store.py`/`chroma_store.py` themselves untouched.
+- New `src/amc_orchestrator/runtime_entrypoint.py`
+  (`bedrock_agentcore.runtime.BedrockAgentCoreApp`, `@app.entrypoint`),
+  reusing `build_rfp_graph`/`summarize_result`/`summarize_exception`
+  exactly as `cli.py`/`api/routes/rfp.py` already do - no new translation
+  logic, same resilience contract.
+- New repo-root `Dockerfile` - `linux/arm64` (AgentCore Runtime requires
+  Graviton), `uv`-based, matching Strands' own AgentCore deployment guide's
+  pattern.
+- `infra/terraform/modules/agentcore-runtime` + all three `environments/*/main.tf`:
+  added `BEDROCK_KNOWLEDGE_BASE_ID` to the runtime's `environment_variables`.
+
+**Verified for real, not just unit-tested**: `uv run python -m pytest
+tests/unit -q` - **64 passed**. Then a live local smoke test:
+`uv run python -m uvicorn amc_orchestrator.runtime_entrypoint:app` really
+running, `GET /ping` returning `Healthy`, a missing-`prompt` payload
+correctly rejected, and **one real end-to-end `POST /invocations` call
+against real Ollama actually completing** (`succeeded=true,
+escalated=false, graph_status=completed`, a real compliant synthesized
+report for the INC2 query) - proof the entrypoint genuinely works through
+the real AgentCore HTTP contract, not just through mocks. `docker build
+--platform linux/arm64 ...` was **not verified** - Docker Desktop's daemon
+wasn't running on this machine this session; the Dockerfile itself is
+unverified by an actual build, flagged rather than assumed working.
+
+**Environment quirk found, worth knowing**: on this machine, `uv run
+pytest ...` (the `.exe` console-script launcher) misresolves
+`amc_orchestrator` imports to a sibling `Phase-01` directory for some
+(not all) test modules - a pre-existing, unrelated launcher issue, not
+caused by any code here. `uv run python -m pytest ...` does not have this
+problem and resolves correctly every time - **use that form, not
+`uv run pytest`, on this machine.**
+
+Natural next step: push a real image to the ECR repo pass 1 already
+created, set `enable_agent_runtime = true` (and `container_image_uri`),
+apply - the first real, invokable AgentCore Runtime. Real AWS action
+(image push + apply), should be confirmed with the user first, not
+auto-run.
