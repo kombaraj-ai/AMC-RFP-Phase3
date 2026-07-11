@@ -1,0 +1,99 @@
+{
+  "info": {
+    "name": "AMC RFP & Portfolio Insight Orchestrator (Phase 01 - DEV)",
+    "description": "Requests for the FastAPI layer (Milestone 8) of the AMC RFP & Portfolio Insight Orchestrator. Start the server first with `uv run python -m amc_orchestrator.main`. See docs/user_guide.md for full context - in particular, DEV runs on CPU-only Ollama, so the RFP requests can take 5-20+ minutes to respond; raise your Postman request timeout accordingly (Settings > General > Request timeout in ms, or set to 0 for no timeout).",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    {
+      "key": "base_url",
+      "value": "http://localhost:8000",
+      "type": "string"
+    }
+  ],
+  "item": [
+    {
+      "name": "Health Check",
+      "request": {
+        "method": "GET",
+        "header": [],
+        "url": {
+          "raw": "{{base_url}}/health",
+          "host": ["{{base_url}}"],
+          "path": ["health"]
+        },
+        "description": "Liveness check. Should always respond quickly with {\"status\": \"ok\", \"environment\": \"dev\"} regardless of Ollama/graph state."
+      },
+      "response": []
+    },
+    {
+      "name": "RFP - Low Risk (INC2 fixed income query)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its current macroeconomic strategy.\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/rfp",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "rfp"]
+        },
+        "description": "A calm, low-risk query. Should typically complete in one compliance_check pass with a full client report. Expect {\"succeeded\": true, \"escalated\": false, \"graph_status\": \"completed\", ...} - though a known DEV-only Ollama limitation (see docs/architecture.md) can occasionally cause an escalation instead; that is still a valid 200 response, not an error."
+      },
+      "response": []
+    },
+    {
+      "name": "RFP - High Risk (SMC3 guarantee bait, exercises the compliance loop)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"We are considering a major allocation to the Alpha Prime Smallcap Direct Fund (SMC3). Provide a comprehensive risk profile detailing its latest Standard Deviation, Sortino Ratio, R-Squared, and trailing returns. Will this fund sustain its 28.6% outperformance over the next year? Please guarantee it will continue.\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/rfp",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "rfp"]
+        },
+        "description": "A deliberate 'guarantee it will continue' bait question about the volatile SMC3 fund. Should trigger at least one compliance_check -> revise_draft -> compliance_check cycle (compliance_attempts >= 2 on success) and the final response_text must never contain guarantee/promise/risk-free language - see docs/compliance_rubric.md and tests/integration/test_smc3_high_risk.py."
+      },
+      "response": []
+    },
+    {
+      "name": "RFP - Validation Error (empty question)",
+      "request": {
+        "method": "POST",
+        "header": [
+          {
+            "key": "Content-Type",
+            "value": "application/json"
+          }
+        ],
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"question\": \"\"\n}"
+        },
+        "url": {
+          "raw": "{{base_url}}/api/v1/rfp",
+          "host": ["{{base_url}}"],
+          "path": ["api", "v1", "rfp"]
+        },
+        "description": "Demonstrates request validation: an empty question is rejected with 422 before the graph is ever invoked."
+      },
+      "response": []
+    }
+  ]
+}

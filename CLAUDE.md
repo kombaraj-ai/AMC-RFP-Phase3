@@ -116,9 +116,17 @@ Working through the approved plan's 10 milestones sequentially:
       live out-of-process `uvicorn` smoke test (`/health`, `/openapi.json`,
       and a validation-rejection POST all confirmed working for real, not
       just via `TestClient`).
-- [ ] M9 — docs (`docs/architecture.md`, `docs/user_guide.md`, Postman
-      collection) (not started — this CLAUDE.md is a stopgap, not a
-      replacement for those)
+- [x] M9 — `docs/architecture.md` (system reference: graph topology, both
+      real bugs and their fixes, termination/synthesizer/data-layer/model-
+      abstraction/observability design, repo map), `docs/user_guide.md`
+      (setup, full `Settings` env-var reference, mock fund data table, CLI +
+      API usage with PowerShell-friendly examples, troubleshooting),
+      `docs/compliance_rubric.md` (verbatim mirror of
+      `config/compliance_rubric.py`, per that file's own docstring promise),
+      `docs/postman/amc_orchestrator.postman_collection.json` (health check +
+      low-risk INC2 + high-risk SMC3 + validation-error requests against the
+      real `POST /api/v1/rfp`). This CLAUDE.md remains the working session
+      log; those are the stable reference docs.
 - [ ] M10 — hardening (ticker-not-found path, forced
       `MAX_COMPLIANCE_ATTEMPTS=1` escalation test, etc.)
 
@@ -127,9 +135,10 @@ Working through the approved plan's 10 milestones sequentially:
 **Decision made 2026-07-11**: the `StructuredOutputException` flakiness is a
 known, root-caused DEV-only limitation (Ollama ignores `tool_choice` - see
 Bug #2 addendum). It's parked, not chased further. M7 (retry fix + hardened
-integration tests, both passing live) and M8 (FastAPI layer, unit-tested +
-live-smoke-tested) are both done this session. Next up: M9 (docs) or M10
-(hardening edge cases) - neither started yet.
+integration tests, both passing live), M8 (FastAPI layer, unit-tested +
+live-smoke-tested), and M9 (docs) are all done this session. Next up: M10
+(hardening edge cases - ticker-not-found path, forced
+`MAX_COMPLIANCE_ATTEMPTS=1` escalation test) - not started yet.
 
 ## Architecture (why it's built this way)
 
