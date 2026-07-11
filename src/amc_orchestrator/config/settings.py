@@ -52,6 +52,10 @@ class Settings(BaseSettings):
 
     # --- Compliance self-correction loop ---
     max_compliance_attempts: int = 3
+    # Retries within a single compliance_check node call when qwen2.5:7b-instruct
+    # fails to invoke the structured-output tool (StructuredOutputException) -
+    # separate from max_compliance_attempts, which governs REJECTED verdicts.
+    compliance_structured_output_max_attempts: int = 3
     # Note: Strands GraphBuilder.set_execution_timeout() takes SECONDS, not ms.
     graph_execution_timeout_seconds: int = 300
     graph_max_node_executions: int = 12

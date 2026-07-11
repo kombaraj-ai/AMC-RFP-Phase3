@@ -8,7 +8,13 @@ make a deterministic decision.
 
 from __future__ import annotations
 
+import copy
+from collections.abc import AsyncIterator
+from typing import Any
+
+import structlog
 from strands import Agent
+from strands.types.exceptions import StructuredOutputException
 
 from amc_orchestrator.config.compliance_rubric import COMPLIANCE_RUBRIC
 from amc_orchestrator.config.model_factory import get_model
@@ -17,6 +23,8 @@ from amc_orchestrator.observability.hooks import LoggingHookProvider
 from amc_orchestrator.schemas.compliance import ComplianceVerdict
 
 NODE_NAME = "compliance_check"
+
+logger = structlog.get_logger(__name__)
 
 SYSTEM_PROMPT = f"""\
 You are the Chief Compliance Officer (CCO) Agent for a Mutual Fund AMC,
@@ -59,10 +67,49 @@ You MUST call your structured output tool with:
 """
 
 
+class _RetryingComplianceAgent(Agent):
+    """Compliance Agent that retries the whole turn on `StructuredOutputException`.
+
+    `qwen2.5:7b-instruct` occasionally fails to invoke the structured-output
+    tool even after Strands forces it (see CLAUDE.md "Bug #2" - observed on
+    2 of 3 end-to-end CLI runs). Strands only auto-retries model calls for
+    `ModelThrottledException` (`strands.event_loop._retry.ModelRetryStrategy`),
+    never for this exception, so a clean-slate manual retry is layered on top
+    here: on failure, the conversation is rolled back to what it was before
+    the attempt and re-sent from scratch, up to `max_attempts` times total.
+    """
+
+    def __init__(self, *, max_attempts: int = 3, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self._max_structured_output_attempts = max_attempts
+
+    async def stream_async(
+        self, prompt: Any = None, *, invocation_state: dict[str, Any] | None = None, **kwargs: Any
+    ) -> AsyncIterator[Any]:
+        messages_before_attempt = copy.deepcopy(self.messages)
+        for attempt in range(1, self._max_structured_output_attempts + 1):
+            try:
+                stream = super().stream_async(prompt, invocation_state=invocation_state, **kwargs)
+                async for event in stream:
+                    yield event
+                return
+            except StructuredOutputException:
+                self.messages = copy.deepcopy(messages_before_attempt)
+                if attempt == self._max_structured_output_attempts:
+                    raise
+                logger.warning(
+                    "compliance_structured_output_retry",
+                    node=NODE_NAME,
+                    attempt=attempt,
+                    max_attempts=self._max_structured_output_attempts,
+                )
+
+
 def get_compliance_agent(settings: Settings) -> Agent:
     """Build the Compliance & Risk (LLM-as-a-Judge) Agent."""
     model = get_model(settings, temperature=settings.model_temperature_judge)
-    return Agent(
+    return _RetryingComplianceAgent(
+        max_attempts=settings.compliance_structured_output_max_attempts,
         model=model,
         system_prompt=SYSTEM_PROMPT,
         structured_output_model=ComplianceVerdict,
