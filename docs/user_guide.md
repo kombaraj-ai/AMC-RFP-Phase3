@@ -360,6 +360,34 @@ already granted for the chosen model/embedding model (an account-level opt-in, n
 Terraform provisions). See [`CLAUDE.md`](../CLAUDE.md)'s "Phase 02" section for the locked-in
 architecture decisions (network mode, database choice, auth model) and why each one was made.
 
+**Re-provisioning dev after a full teardown — read before your first `terraform apply`.** If
+dev was previously fully torn down (`terraform state list` empty), check
+`environments/dev/terraform.tfvars` before applying: it may still have `enable_knowledge_base`
+and `enable_agent_runtime` left set to `true` from before the teardown, plus a
+`container_image_uri` referencing an image tag that no longer exists (deleted along with
+everything else). Since state is empty, a single `terraform apply` in that state would attempt
+**all three passes at once** — including the Agent Runtime referencing a container image that
+doesn't exist yet in the freshly-recreated, empty ECR repo — and fail partway through pass 3.
+Either:
+- Temporarily set `enable_agent_runtime = false` for the first apply (the safe, originally-designed
+  incremental flow — pass 1, then pass 2, then flip back to `true` for pass 3 once a fresh image
+  is actually pushed), or
+- Build and push a fresh image to the ECR URL *before* applying, if you're confident of the
+  target URL: it's deterministic (`<account_id>.dkr.ecr.<region>.amazonaws.com/<name_prefix>-agent-runtime`,
+  from `modules/ecr`), so the existing `container_image_uri` string in `terraform.tfvars` is
+  likely still correct — but the repo itself doesn't exist until pass 1 creates it, so a
+  `docker push` will fail until then. Simplest sequencing:
+  1. `terraform apply -target=module.ecr` (creates just the ECR repo).
+  2. `docker build`/`push` a fresh image to that URL (see
+     [Building and pushing the container image](#building-and-pushing-the-container-image-pass-3)
+     below).
+  3. Full `terraform apply` (all three passes, since the flags are already `true` and the image
+     now exists).
+
+`enable_knowledge_base = true` is lower-risk to leave as-is — pass 2 no longer needs the AOSS
+community-provider dance at all if `vector_store_backend = "s3_vectors"` (dev's current setting,
+see below), so there's no equivalent "resource doesn't exist yet" trap for that flag.
+
 ### Testing the AgentCore Runtime entrypoint locally (no Docker/AWS needed)
 
 `runtime_entrypoint.py` implements the exact HTTP contract AgentCore Runtime expects, so you can
@@ -417,9 +445,11 @@ triggers ingestion).
   `additional_data_access_principals` set first (see below).
 - `"s3_vectors"` (**dev-only**) — Amazon S3 Vectors, the cheapest vector store Bedrock Knowledge
   Base supports, via the new `modules/s3-vectors` (a native `hashicorp/aws` resource — no
-  community provider, no `additional_data_access_principals` step needed for this piece). Set
-  `vector_store_backend = "s3_vectors"` in `environments/dev/terraform.tfvars` (already the
-  default there) before this pass. **Note**: the OpenSearch Serverless collection itself is
+  community provider, no `additional_data_access_principals` step needed for this piece).
+  `environments/dev/terraform.tfvars` already sets `vector_store_backend = "s3_vectors"` — that's
+  a `terraform.tfvars` override, not the variable's own `default` (which stays `"opensearch"` in
+  all three environments, dev included, as a safe fallback — see `variables.tf`). **Note**: the
+  OpenSearch Serverless collection itself is
   still created in dev either way (other resources depend on it) — this backend only avoids the
   vector-index/Knowledge-Base-storage cost, not the collection's own baseline cost. See
   [`architecture.md`](architecture.md#dev-only-vector-store-choice-opensearch-serverless-vs-s3-vectors)
@@ -453,9 +483,10 @@ for staging/prod.
 ### Testing the deployed AgentCore Runtime (Phase 02)
 
 Once pass 3 is applied and the image is pushed, the Runtime is a real, invokable AWS resource —
-independent of anything on your local machine (no Ollama, no local server). Two ways to test it
-(the Streamlit UI is **not** one of them — see the note in
-[Running via the Streamlit UI](#running-via-the-streamlit-ui) above):
+independent of anything on your local machine (no Ollama, no local server). Three ways to test it
+— the Streamlit UI's **Deployed AgentCore Runtime (AWS)** mode (see
+[Running via the Streamlit UI](#running-via-the-streamlit-ui) above) is the quickest for
+interactive testing; the two scripted options below are what was used to verify dev:
 
 **Python/boto3** (what was used to verify dev):
 
