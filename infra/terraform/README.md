@@ -170,14 +170,20 @@ terraform apply
 - **`terraform plan`/`apply` need real AWS credentials and the bootstrap
   bucket to exist.** `terraform validate` (schema/type checking, no
   credentials needed) is what CI or a quick sanity check should run instead.
-- **S3 Vectors' exact IAM action names and IAM/data-type/distance-metric
-  values are not independently verified against an authoritative AWS
-  source** (`modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane`
-  statement, `modules/s3-vectors/variables.tf`'s `data_type`/
-  `distance_metric` defaults) - taken from AWS's own reference examples,
-  flagged in both files' comments. Confirm against AWS's Service
-  Authorization Reference before relying on this outside of dev
-  experimentation.
+- **S3 Vectors IAM action names are plural ("Vectors"), not singular** -
+  `modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane` statement
+  originally guessed singular (`GetVector`/`PutVector`/`DeleteVector`) from
+  a third-party reference and failed with a real `AccessDenied` on
+  `s3vectors:GetVectors` during a real dev apply (the KB service tries a
+  read at creation time, not just during later ingestion) - fixed and
+  confirmed against AWS's own IAM policy examples
+  (`docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-iam-policies.html`).
+  `modules/s3-vectors/variables.tf`'s `data_type`/`distance_metric`
+  defaults (`"float32"`/`"cosine"`) are now confirmed to work too - the
+  same apply successfully created the vector bucket and index with those
+  values, before failing on the (now-fixed) IAM issue. Whether `"cosine"`
+  is the *optimal* choice for retrieval quality (vs. just a valid one)
+  is a separate, non-blocking question not yet investigated.
 - **`modules/opensearch-serverless`/`modules/opensearch-access-policy` carry
   `moved.tf` files.** These exist because their resources gained `count =
   var.enabled ? 1 : 0` (to fully skip the collection when

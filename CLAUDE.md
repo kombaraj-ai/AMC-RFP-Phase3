@@ -689,6 +689,49 @@ path isn't live today for any of the three - included anyway as correct,
 cheap defensive design. **Not yet applied to real AWS** - same
 `fmt`/`validate`/`plan` verification as above is the next step.
 
+**Live dev re-deploy, same day (2026-07-12): two real bugs found and fixed
+mid-apply.** The user started re-provisioning dev from scratch. AgentCore
+Memory created fine (~2m42s), then the apply hit two real, sequential
+errors on `module.knowledge_base[0]` - both fixed and re-verified, neither
+caught by `terraform validate`/`plan` beforehand since both only surface
+with concrete values a real apply produces:
+
+1. **`aws_bedrockagent_knowledge_base`'s `s3_vectors_configuration` rejects
+   `index_arn` combined with `vector_bucket_arn`/`index_name`** -
+   "Invalid Attribute Combination". A `ConflictsWith` constraint the
+   provider schema dump used to design this block only showed as three
+   independently-optional attributes, not the real AWS API rule. Fixed by
+   using `index_arn` alone (`modules/s3-vectors` already computes it
+   directly) - simpler than the pair anyway. Removed the now-unused
+   `s3_vectors_bucket_arn`/`s3_vectors_index_name` variables from
+   `modules/knowledge-base` and the corresponding args from all three
+   environments' `module.knowledge_base` call sites.
+2. **The `S3VectorsDataPlane` IAM statement's action names were wrong**:
+   `AccessDenied` on `s3vectors:GetVectors` - the KB service reads from the
+   index at *creation* time, not just later ingestion, so this fired
+   immediately once the storage-config bug above was fixed. The original
+   guess (singular `GetVector`/`PutVector`/`DeleteVector`, from a
+   third-party reference, flagged as unverified in the prior session's log
+   entry above) was wrong - real actions are plural
+   (`GetVectors`/`PutVectors`/`DeleteVectors`), confirmed against AWS's own
+   IAM policy examples
+   (`docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-iam-policies.html`)
+   this time, not a blog post. `QueryVectors`/`ListVectors`/`GetIndex`/
+   `ListIndexes` were already correct. The same apply's earlier success
+   creating the S3 Vectors bucket+index also confirms
+   `modules/s3-vectors/variables.tf`'s `data_type = "float32"`/
+   `distance_metric = "cosine"` defaults are valid - only their optimality
+   for retrieval quality (vs. just validity) remains unconfirmed, a
+   separate non-blocking question.
+
+`terraform validate` re-confirmed clean on all three environments after
+both fixes. Dev's re-apply was still in progress as of this log entry (not
+yet confirmed all the way through to a live, `APPROVED` end-to-end query
+like the original Phase 02 deploy achieved) - resume by re-running
+`terraform apply` in `environments/dev`, which should proceed from the
+already-created resources (Memory, DynamoDB, ECR, S3 docs bucket, IAM,
+Lambda stubs, S3 Vectors bucket+index) rather than recreating them.
+
 Provisions every AWS resource the deployed system needs (AgentCore
 Runtime/Gateway/Memory, ECR, DynamoDB, OpenSearch Serverless + Bedrock
 Knowledge Base, Lambda tool stubs, IAM, observability) via modular

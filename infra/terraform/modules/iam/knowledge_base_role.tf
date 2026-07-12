@@ -51,22 +51,25 @@ data "aws_iam_policy_document" "kb_permissions" {
   }
 
   # S3 Vectors data-plane access (dev-only backend, see
-  # environments/dev/variables.tf's vector_store_backend). Action list taken
-  # from AWS's own S3-Vectors-for-Bedrock reference examples, NOT
-  # independently verified against AWS's Service Authorization Reference
-  # (docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3vectors.html)
-  # - confirm there before relying on this outside of dev experimentation,
-  # per this project's own precedent (CLAUDE.md's M0 note) of verifying
-  # against real sources rather than blog posts.
+  # environments/dev/variables.tf's vector_store_backend). Action names
+  # confirmed against AWS's official IAM policy examples
+  # (docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-iam-policies.html,
+  # the "Application-specific access policy" and "AllowGetIndex"/
+  # "AllowIndexInspection" statements) after the first real terraform apply
+  # against dev failed with AccessDenied on s3vectors:GetVectors - the
+  # initial guess (singular "Vector": GetVector/PutVector/DeleteVector) was
+  # wrong, the real actions are plural ("Vectors"), matching QueryVectors/
+  # ListVectors which were already correct. GetIndex/ListIndexes were
+  # already correct too.
   dynamic "statement" {
     for_each = var.s3_vectors_bucket_arn != "" ? [1] : []
     content {
       sid    = "S3VectorsDataPlane"
       effect = "Allow"
       actions = [
-        "s3vectors:GetVector",
-        "s3vectors:PutVector",
-        "s3vectors:DeleteVector",
+        "s3vectors:GetVectors",
+        "s3vectors:PutVectors",
+        "s3vectors:DeleteVectors",
         "s3vectors:QueryVectors",
         "s3vectors:ListVectors",
         "s3vectors:GetIndex",

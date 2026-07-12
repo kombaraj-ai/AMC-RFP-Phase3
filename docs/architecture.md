@@ -384,13 +384,19 @@ in `staging/terraform.tfvars` and gets silently overridden back to OpenSearch wo
 to know their intent was ignored — a loud `terraform plan` validation error is the safer failure
 mode at this layer.
 
-**Two implementation details are flagged, not silently assumed**: the exact `s3vectors:*` IAM
-action names (`modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane` statement) and the
-`data_type`/`distance_metric` values (`modules/s3-vectors/variables.tf`) were taken from AWS's
-own S3-Vectors-for-Bedrock reference examples, not independently verified against AWS's Service
-Authorization Reference or Bedrock integration docs — both files carry an explicit comment to
-that effect, consistent with this project's own M0 precedent of verifying claims against real
-sources rather than trusting a single reference.
+**The exact `s3vectors:*` IAM action names were wrong on the first real apply, and are now
+fixed and verified.** `modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane` statement
+originally guessed singular action names (`GetVector`/`PutVector`/`DeleteVector`) from a
+third-party reference — a real dev apply failed with `AccessDenied` on `s3vectors:GetVectors`
+(the Bedrock Knowledge Base service reads from the index at creation time, not just during later
+ingestion), revealing the real actions are plural (`GetVectors`/`PutVectors`/`DeleteVectors`),
+matching `QueryVectors`/`ListVectors` which were already correct. Fixed and confirmed against
+AWS's own IAM policy examples
+(`docs.aws.amazon.com/AmazonS3/latest/userguide/s3-vectors-iam-policies.html`), not a blog post —
+consistent with this project's own M0 precedent. The same apply also confirmed
+`modules/s3-vectors/variables.tf`'s `data_type`/`distance_metric` defaults (`"float32"`/
+`"cosine"`) work — the vector bucket and index were created successfully before the IAM issue
+surfaced on the Knowledge Base resource specifically.
 
 ### The app-code follow-on: AgentCore entrypoint + DynamoDB/Knowledge Base data layer
 
