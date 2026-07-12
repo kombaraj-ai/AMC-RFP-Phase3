@@ -14,6 +14,8 @@ locals {
 }
 
 resource "aws_opensearchserverless_security_policy" "encryption" {
+  count = var.enabled ? 1 : 0
+
   name        = "${local.collection_name}-enc"
   type        = "encryption"
   description = "Encryption policy for ${local.collection_name}"
@@ -46,6 +48,8 @@ resource "aws_opensearchserverless_security_policy" "encryption" {
 # data access policy below and by IAM on every caller, not by network
 # isolation.
 resource "aws_opensearchserverless_security_policy" "network" {
+  count = var.enabled ? 1 : 0
+
   name        = "${local.collection_name}-net"
   type        = "network"
   description = "Public network policy for ${local.collection_name} (PUBLIC runtime network mode)"
@@ -69,6 +73,8 @@ resource "aws_opensearchserverless_security_policy" "network" {
 }
 
 resource "aws_opensearchserverless_collection" "kb_vectors" {
+  count = var.enabled ? 1 : 0
+
   name             = local.collection_name
   type             = "VECTORSEARCH"
   standby_replicas = var.standby_replicas

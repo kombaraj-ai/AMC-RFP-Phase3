@@ -35,6 +35,7 @@ module "s3_kb_docs" {
 module "opensearch_serverless" {
   source = "../../modules/opensearch-serverless"
 
+  enabled          = local.opensearch_enabled
   name_prefix      = local.name_prefix
   use_cmk          = var.use_cmk
   standby_replicas = var.opensearch_standby_replicas
@@ -61,6 +62,7 @@ module "iam" {
 module "opensearch_access_policy" {
   source = "../../modules/opensearch-access-policy"
 
+  enabled         = local.opensearch_enabled
   collection_name = module.opensearch_serverless.collection_name
   principal_arns  = module.iam.data_access_principal_arns
   tags            = local.common_tags

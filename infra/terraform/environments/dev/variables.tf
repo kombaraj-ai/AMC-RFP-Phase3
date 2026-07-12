@@ -26,7 +26,7 @@ variable "enable_knowledge_base" {
 }
 
 variable "vector_store_backend" {
-  description = "Vector store backing the Bedrock Knowledge Base: \"opensearch\" (Amazon OpenSearch Serverless) or \"s3_vectors\" (Amazon S3 Vectors - cheapest, dev-only). Only affects the vector index / KB storage resources - the OpenSearch Serverless collection itself is still created either way (see docs/architecture.md's \"Environment lifecycle\" section)."
+  description = "Vector store backing the Bedrock Knowledge Base: \"opensearch\" (Amazon OpenSearch Serverless) or \"s3_vectors\" (Amazon S3 Vectors - cheapest, dev-only). \"s3_vectors\" creates zero OpenSearch resources, including the collection itself, for full cost savings (see docs/architecture.md's \"Dev-only vector store choice\" section)."
   type        = string
   default     = "opensearch"
 

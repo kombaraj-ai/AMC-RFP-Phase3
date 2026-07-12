@@ -655,6 +655,40 @@ zero changes; dev should plan to create `module.s3_vectors` and skip
 `module.opensearch_index`) is the next verification step before dev's
 fresh 3-pass apply (item 1 above).
 
+**Follow-up, same day (2026-07-12): full collection-level gating ("Option
+B").** The user confirmed a real `terraform plan` showed the OpenSearch
+Serverless collection still being created in dev even with
+`vector_store_backend = "s3_vectors"` selected (exactly the documented
+trade-off above), then asked for the deferred full-savings design.
+`modules/opensearch-serverless` and `modules/opensearch-access-policy`
+gained an `enabled` variable (default `true`) with `count = var.enabled ?
+1 : 0` moved *inside* each module rather than onto the module block at the
+root call site - this keeps `module.opensearch_serverless.collection_endpoint`
+a plain singleton-module reference everywhere it's consumed (`providers.tf`'s
+`opensearch` provider block in particular), never a `[0]`-indexed one,
+which HashiCorp's own docs (fetched this session) confirm provider-block
+arguments generally can't depend on. Two things found only by directly
+verifying against the repo, not assumed: (1) no `moved` blocks existed
+anywhere in this Terraform tree - added `moved.tf` in both modules so the
+un-indexed → `[0]` address change is a state rename, not a
+destroy+recreate, on any environment that already had these resources
+applied; (2) `var.opensearch_collection_arn` is consumed unconditionally
+in **three** `modules/iam` files, not the one already fixed for S3 Vectors
+(`knowledge_base_role.tf`) - `lambda_execution_role.tf` and
+`runtime_role.tf` also needed the same `dynamic "statement"` treatment, or
+`terraform apply` would fail outright in dev's `s3_vectors` mode (AWS
+rejects an IAM statement with an empty-string ARN resource). A Plan-mode
+design-review agent caught both gaps; both were independently confirmed via
+`grep` before being trusted. `providers.tf`, `lambda-tools`, and root
+`outputs.tf` needed **no changes** at all, since they already just forward
+`module.opensearch_serverless`'s outputs, which now safely resolve to `""`
+when disabled. Timing note: dev, staging, and prod all currently have
+empty Terraform state (confirmed via `terraform state list` in dev and the
+absence of `backend.hcl` in staging/prod), so the `moved`-block migration
+path isn't live today for any of the three - included anyway as correct,
+cheap defensive design. **Not yet applied to real AWS** - same
+`fmt`/`validate`/`plan` verification as above is the next step.
+
 Provisions every AWS resource the deployed system needs (AgentCore
 Runtime/Gateway/Memory, ECR, DynamoDB, OpenSearch Serverless + Bedrock
 Knowledge Base, Lambda tool stubs, IAM, observability) via modular

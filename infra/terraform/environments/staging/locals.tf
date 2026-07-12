@@ -3,6 +3,13 @@ data "aws_caller_identity" "current" {}
 locals {
   name_prefix = "${var.project}-${var.environment}"
 
+  # Single source of truth for whether the OpenSearch Serverless collection
+  # (and its access policy) should exist at all - spelled out once here so
+  # collection creation and access-policy creation can never desync. false
+  # only when the dev-only vector_store_backend = "s3_vectors" is selected
+  # (always true here - vector_store_backend is hard-locked to "opensearch").
+  opensearch_enabled = var.vector_store_backend == "opensearch"
+
   common_tags = {
     Project     = var.project
     Environment = var.environment

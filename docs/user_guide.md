@@ -448,12 +448,11 @@ triggers ingestion).
   community provider, no `additional_data_access_principals` step needed for this piece).
   `environments/dev/terraform.tfvars` already sets `vector_store_backend = "s3_vectors"` — that's
   a `terraform.tfvars` override, not the variable's own `default` (which stays `"opensearch"` in
-  all three environments, dev included, as a safe fallback — see `variables.tf`). **Note**: the
-  OpenSearch Serverless collection itself is
-  still created in dev either way (other resources depend on it) — this backend only avoids the
-  vector-index/Knowledge-Base-storage cost, not the collection's own baseline cost. See
+  all three environments, dev included, as a safe fallback — see `variables.tf`). **This backend
+  creates zero OpenSearch resources at all** — the collection itself and its access policy are
+  skipped too, for full cost savings, not just the vector-index/Knowledge-Base-storage piece. See
   [`architecture.md`](architecture.md#dev-only-vector-store-choice-opensearch-serverless-vs-s3-vectors)
-  for the full trade-off and why it was scoped that way.
+  for the full design.
 
 Document ingestion (the steps below) is identical regardless of which backend is selected — it
 uploads to the same S3 docs bucket either way. This is what actually happened for dev (on the

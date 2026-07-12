@@ -6,6 +6,8 @@
 # both into one module would be a dependency cycle; see
 # environments/*/main.tf for the actual apply order.
 resource "aws_opensearchserverless_access_policy" "data" {
+  count = var.enabled ? 1 : 0
+
   name        = "${var.collection_name}-data"
   type        = "data"
   description = "Data-plane access for ${var.collection_name}"

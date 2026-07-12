@@ -65,9 +65,13 @@ terraform apply
 ```
 
 Creates: IAM roles, ECR repo (empty), S3 docs bucket, DynamoDB table,
-OpenSearch Serverless collection + encryption/network/data-access policies,
 Lambda tool stubs, AgentCore Gateway + targets, AgentCore Memory,
-observability (log groups/dashboard/alarms).
+observability (log groups/dashboard/alarms), and - only when
+`vector_store_backend = "opensearch"` (the default; the only option in
+staging/prod) - the OpenSearch Serverless collection + encryption/network/
+data-access policies. When `vector_store_backend = "s3_vectors"` (dev-only),
+none of the OpenSearch resources are created at all, even in this pass -
+see "Pass 2" below.
 
 ### Pass 2 — vector index + Knowledge Base
 
@@ -99,12 +103,18 @@ Without it, index creation fails with an AOSS authorization error.
 `hashicorp/aws` (`aws_s3vectors_vector_bucket`/`aws_s3vectors_index`,
 landed in provider `>= 6.27.0`) - a native resource, so unlike the
 OpenSearch path there's no community provider and no
-`additional_data_access_principals` step needed for this piece. Note:
-the OpenSearch Serverless *collection* itself is still created in pass 1
-regardless of this setting (it has other, unrelated consumers) - this
-backend only skips the vector-index/KB-storage cost, not the collection's
-baseline cost. See `docs/architecture.md`'s "Environment lifecycle:
-teardown and cost control" section for the full trade-off.
+`additional_data_access_principals` step needed for this piece. The
+OpenSearch Serverless collection itself (pass 1) and its access policy are
+also skipped entirely with this backend - `modules/opensearch-serverless`
+and `modules/opensearch-access-policy` gate their resources internally via
+an `enabled` variable (not `count` on the module block, to keep every
+consumer of their outputs - the `opensearch` provider block in particular -
+a plain singleton-module reference rather than a `[0]`-indexed one), so
+this backend creates **zero** OpenSearch resources for full cost savings.
+See `docs/architecture.md`'s "Dev-only vector store choice" section for the
+full design reasoning, including the `moved` blocks that keep this change
+non-destructive for any environment that already had the collection
+applied un-indexed.
 
 ```powershell
 # after editing terraform.tfvars: enable_knowledge_base = true, plus
@@ -168,6 +178,24 @@ terraform apply
   flagged in both files' comments. Confirm against AWS's Service
   Authorization Reference before relying on this outside of dev
   experimentation.
+- **`modules/opensearch-serverless`/`modules/opensearch-access-policy` carry
+  `moved.tf` files.** These exist because their resources gained `count =
+  var.enabled ? 1 : 0` (to fully skip the collection when
+  `vector_store_backend = "s3_vectors"`) - without the `moved` blocks,
+  Terraform would treat the address change as a destroy+recreate of the
+  whole collection on any environment that already had it applied
+  un-indexed, not a harmless rename. Don't delete these files as "unused
+  cleanup" without checking whether any environment's state still needs
+  the migration path first.
+- **Switching `vector_store_backend` on an environment that already has
+  `enable_knowledge_base = true` applied is a two-step operation, not
+  one.** Flipping the backend var while the Knowledge Base is enabled means
+  the old backend's vector index/collection and the new backend's resources
+  would need to be torn down and stood up in the same apply, which exercises
+  the `opensearch` Terraform provider's configuration machinery in a way
+  that isn't empirically verified. Set `enable_knowledge_base = false` and
+  apply first (tears down the old backend cleanly), then flip
+  `vector_store_backend` and re-enable in a second apply.
 
 ## Settings mapping (handoff to the app-code follow-on task)
 

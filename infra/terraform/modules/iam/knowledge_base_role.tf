@@ -40,11 +40,14 @@ data "aws_iam_policy_document" "kb_permissions" {
     resources = var.bedrock_model_arns
   }
 
-  statement {
-    sid       = "OpenSearchServerlessDataPlane"
-    effect    = "Allow"
-    actions   = ["aoss:APIAccessAll"]
-    resources = [var.opensearch_collection_arn]
+  dynamic "statement" {
+    for_each = var.opensearch_collection_arn != "" ? [1] : []
+    content {
+      sid       = "OpenSearchServerlessDataPlane"
+      effect    = "Allow"
+      actions   = ["aoss:APIAccessAll"]
+      resources = [var.opensearch_collection_arn]
+    }
   }
 
   # S3 Vectors data-plane access (dev-only backend, see

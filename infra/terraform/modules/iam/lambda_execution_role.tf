@@ -28,11 +28,14 @@ data "aws_iam_policy_document" "lambda_permissions" {
     resources = [var.dynamodb_table_arn, "${var.dynamodb_table_arn}/index/*"]
   }
 
-  statement {
-    sid       = "OpenSearchServerlessDataPlane"
-    effect    = "Allow"
-    actions   = ["aoss:APIAccessAll"]
-    resources = [var.opensearch_collection_arn]
+  dynamic "statement" {
+    for_each = var.opensearch_collection_arn != "" ? [1] : []
+    content {
+      sid       = "OpenSearchServerlessDataPlane"
+      effect    = "Allow"
+      actions   = ["aoss:APIAccessAll"]
+      resources = [var.opensearch_collection_arn]
+    }
   }
 
   statement {

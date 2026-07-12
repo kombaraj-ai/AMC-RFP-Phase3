@@ -17,8 +17,9 @@ variable "dynamodb_table_arn" {
 }
 
 variable "opensearch_collection_arn" {
-  description = "ARN of the OpenSearch Serverless collection."
+  description = "ARN of the OpenSearch Serverless collection. Empty string when vector_store_backend = \"s3_vectors\" - gates the OpenSearchServerlessDataPlane statement in knowledge_base_role.tf/lambda_execution_role.tf/runtime_role.tf, mirroring s3_vectors_bucket_arn's convention below."
   type        = string
+  default     = ""
 }
 
 variable "s3_vectors_bucket_arn" {

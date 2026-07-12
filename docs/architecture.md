@@ -356,18 +356,26 @@ above, without touching the OpenSearch modules themselves. `environments/staging
 hard-lock this variable to `"opensearch"` (a `validation` block, not a silent override — see
 below) since that's the right choice for production traffic.
 
-**Deliberately minimal blast radius**: only `modules/opensearch-index` and the Knowledge Base's
-`storage_configuration` block become backend-conditional (via `dynamic` blocks in
-`modules/knowledge-base/main.tf`, gated on `vector_store_backend`); `modules/opensearch-serverless`,
-`modules/opensearch-access-policy`, the `opensearch` Terraform provider block, and
-`modules/lambda-tools`' (unrelated) OpenSearch endpoint input are all untouched and still
-unconditional. **Concrete consequence**: choosing `"s3_vectors"` in dev still creates the
-OpenSearch Serverless collection (it has other consumers), so this only eliminates the
-vector-index/KB-storage cost, not the collection's own baseline cost — a deliberate trade-off
-for a smaller, lower-risk change over full collection-level savings, which would need to touch
-five files unrelated to the Knowledge Base and one Terraform behavior (a count-conditional
-module reference inside a `provider` block) that isn't yet empirically verified. See
-`infra/terraform/README.md`'s "Pass 2" section for the operational side of this.
+**Full collection-level gating**: choosing `"s3_vectors"` in dev creates zero OpenSearch
+resources — `modules/opensearch-index`, the Knowledge Base's `storage_configuration` block (via
+`dynamic` blocks in `modules/knowledge-base/main.tf`), the OpenSearch Serverless collection
+itself (`modules/opensearch-serverless`), and its access policy
+(`modules/opensearch-access-policy`) are all backend-conditional. The conditionality for the
+latter two lives *inside* each module via a new `enabled` variable rather than `count` on the
+module block at the root call site — this keeps `module.opensearch_serverless.collection_endpoint`
+a plain, always-resolvable singleton-module attribute reference everywhere it's consumed
+(the `opensearch` Terraform provider block, root `outputs.tf`, `modules/lambda-tools`' endpoint
+input — none of which needed any changes), rather than a `[0]`-indexed one, which HashiCorp's own
+docs confirm provider-block arguments generally can't depend on. `modules/iam` gained the same
+`dynamic "statement"` treatment already used for `S3VectorsDataPlane` in all **three** files that
+reference the collection's ARN (`knowledge_base_role.tf`, `lambda_execution_role.tf`,
+`runtime_role.tf`, not just the first one) — a real gap the naive single-file fix would have
+missed, since AWS rejects an IAM policy statement with an empty-string ARN resource. Both modules
+also gained explicit `moved` blocks (`modules/opensearch-serverless/moved.tf`,
+`modules/opensearch-access-policy/moved.tf`) so adding `count` to previously-uncounted resources
+is a state rename, not a destroy+recreate, on any environment that already had them applied —
+verified via `grep` that no `moved` blocks existed anywhere in this Terraform tree before this
+change. See `infra/terraform/README.md`'s "Pass 1" section for the operational side of this.
 
 **Why a `validation` block in staging/prod, not a silent `effective_*` override**: unlike
 `Settings.effective_model_provider`/`effective_data_backend` (app-layer, DEV-respects/
@@ -471,11 +479,10 @@ attempt, 8.3s) rendered correctly via the existing result view.
 ### Environment lifecycle: teardown and cost control
 
 Beyond teardown, dev can also opt into a cheaper vector store while it's running —
-`vector_store_backend = "s3_vectors"` (see "Dev-only vector store choice" above) avoids the
-OpenSearch vector-index/Knowledge-Base-storage cost, though not the OpenSearch Serverless
-collection's own baseline cost, which stays regardless. `modules/s3-vectors` was itself built
-teardown-friendly from day one (`force_destroy = true` on the vector bucket) specifically so it
-doesn't repeat the class of bug described next.
+`vector_store_backend = "s3_vectors"` (see "Dev-only vector store choice" above) creates zero
+OpenSearch resources at all, including the collection itself, for full cost savings.
+`modules/s3-vectors` was itself built teardown-friendly from day one (`force_destroy = true` on
+the vector bucket) specifically so it doesn't repeat the class of bug described next.
 
 `terraform destroy` on a dev environment that has actually been used (a pushed ECR image, ingested
 S3 documents, ingested OpenSearch vector documents) hits AWS's and the OpenSearch community
