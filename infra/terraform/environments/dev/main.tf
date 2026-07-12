@@ -121,9 +121,7 @@ module "knowledge_base" {
   docs_bucket_arn           = module.s3_kb_docs.bucket_arn
   vector_store_backend      = var.vector_store_backend
   opensearch_collection_arn = module.opensearch_serverless.collection_arn
-  s3_vectors_bucket_arn     = var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].vector_bucket_arn : ""
   s3_vectors_index_arn      = var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].index_arn : ""
-  s3_vectors_index_name     = var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].index_name : ""
   embedding_model           = var.embedding_model
   tags                      = local.common_tags
 

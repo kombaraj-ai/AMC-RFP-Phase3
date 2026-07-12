@@ -34,12 +34,18 @@ resource "aws_bedrockagent_knowledge_base" "fund_commentary" {
       }
     }
 
+    # aws_bedrockagent_knowledge_base's s3_vectors_configuration accepts
+    # EITHER index_arn alone OR (vector_bucket_arn + index_name) together -
+    # never all three (confirmed the hard way: AWS rejects any combination
+    # mixing index_arn with the other two, "Invalid Attribute Combination",
+    # a ConflictsWith constraint the real provider schema dump used to design
+    # this module didn't surface, since it only listed attributes as
+    # individually optional). index_arn alone is sufficient and simpler,
+    # since modules/s3-vectors already computes it directly.
     dynamic "s3_vectors_configuration" {
       for_each = var.vector_store_backend == "s3_vectors" ? [1] : []
       content {
-        vector_bucket_arn = var.s3_vectors_bucket_arn
-        index_arn         = var.s3_vectors_index_arn
-        index_name        = var.s3_vectors_index_name
+        index_arn = var.s3_vectors_index_arn
       }
     }
   }
@@ -52,8 +58,8 @@ resource "aws_bedrockagent_knowledge_base" "fund_commentary" {
       error_message = "opensearch_collection_arn is required when vector_store_backend = \"opensearch\"."
     }
     precondition {
-      condition     = var.vector_store_backend != "s3_vectors" || (var.s3_vectors_bucket_arn != "" && var.s3_vectors_index_arn != "" && var.s3_vectors_index_name != "")
-      error_message = "s3_vectors_bucket_arn, s3_vectors_index_arn, and s3_vectors_index_name are all required when vector_store_backend = \"s3_vectors\"."
+      condition     = var.vector_store_backend != "s3_vectors" || var.s3_vectors_index_arn != ""
+      error_message = "s3_vectors_index_arn is required when vector_store_backend = \"s3_vectors\"."
     }
   }
 }

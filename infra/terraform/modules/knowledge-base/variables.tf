@@ -35,20 +35,8 @@ variable "vector_index_name" {
   default     = "kb-default-index"
 }
 
-variable "s3_vectors_bucket_arn" {
-  description = "modules/s3-vectors' vector_bucket_arn output. Only used when vector_store_backend = \"s3_vectors\"."
-  type        = string
-  default     = ""
-}
-
 variable "s3_vectors_index_arn" {
-  description = "modules/s3-vectors' index_arn output. Only used when vector_store_backend = \"s3_vectors\"."
-  type        = string
-  default     = ""
-}
-
-variable "s3_vectors_index_name" {
-  description = "modules/s3-vectors' index_name output. Only used when vector_store_backend = \"s3_vectors\"."
+  description = "modules/s3-vectors' index_arn output. Only used when vector_store_backend = \"s3_vectors\" - sufficient on its own (AWS rejects combining it with vector_bucket_arn/index_name, see main.tf's s3_vectors_configuration comment)."
   type        = string
   default     = ""
 }
