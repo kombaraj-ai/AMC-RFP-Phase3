@@ -549,6 +549,7 @@ infra/terraform/
 ├── modules/                       # reusable, environment-agnostic (see table above)
 │   ├── iam/  ecr/  s3-kb-docs/  dynamodb/
 │   ├── opensearch-serverless/  opensearch-access-policy/  opensearch-index/
+│   ├── s3-vectors/                # dev-only alternative to opensearch-index (vector_store_backend)
 │   ├── knowledge-base/  lambda-tools/
 │   ├── agentcore-memory/  agentcore-gateway/  agentcore-runtime/
 │   └── observability/
