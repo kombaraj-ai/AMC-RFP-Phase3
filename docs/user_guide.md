@@ -360,6 +360,18 @@ already granted for the chosen model/embedding model (an account-level opt-in, n
 Terraform provisions). See [`CLAUDE.md`](../CLAUDE.md)'s "Phase 02" section for the locked-in
 architecture decisions (network mode, database choice, auth model) and why each one was made.
 
+**What Pass 1 actually creates** (everything with no not-yet-existing prerequisite): IAM roles
+for the Runtime/Gateway/Lambda-execution/Knowledge-Base (4 roles + policies), the DynamoDB
+quant-metrics table, the (empty) ECR repo, the S3 docs bucket, AgentCore Memory + a semantic
+strategy, the AgentCore Gateway + one target per Lambda tool, the stub tool Lambdas + their log
+groups, and CloudWatch observability (log groups, alarms, a dashboard) — and, **only when
+`vector_store_backend = "opensearch"`** (staging/prod always; dev's default), the OpenSearch
+Serverless collection and its access/encryption/network policies. With dev's actual current
+setting (`vector_store_backend = "s3_vectors"`), **none of the OpenSearch resources are created
+at all** — see [`infra/terraform/README.md`](../infra/terraform/README.md#pass-1--everything-that-doesnt-depend-on-a-not-yet-existing-artifact)
+for the authoritative, always-current version of this list (module-by-module, kept in sync with
+the actual Terraform).
+
 **Re-provisioning dev after a full teardown — read before your first `terraform apply`.** If
 dev was previously fully torn down (`terraform state list` empty), check
 `environments/dev/terraform.tfvars` before applying: it may still have `enable_knowledge_base`
