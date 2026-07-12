@@ -50,6 +50,9 @@ Set any of these as environment variables or in `environments/.env.dev`:
 | `OLLAMA_MODEL_ID` | `qwen2.5:7b-instruct` | Ollama model. Used when the effective provider is Ollama. |
 | `BEDROCK_MODEL_ID` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model. Used when the effective provider is Bedrock (always in staging/prod; opt-in in dev). **This default reached end-of-life on Bedrock** (confirmed live, 2026-07-12 - see [Switching model provider](#switching-model-provider-ollama-vs-bedrock)) — override it, e.g. to `amazon.nova-lite-v1:0`, which the deployed dev Runtime now uses. |
 | `AWS_REGION` | `us-east-1` | Bedrock region. Used when the effective provider is Bedrock. |
+| `DATA_BACKEND` | `local` | `local` \| `aws` — which data layer the quant/qual tools read from. Only takes effect in DEV; STAGING/PROD always use `aws` regardless of this setting (mirrors `MODEL_PROVIDER`/`effective_model_provider`). |
+| `DYNAMODB_TABLE_NAME` | `""` | DynamoDB table for quant metrics. Populated from Terraform's `dynamodb_table_name` output; used when the effective data backend is `aws`. |
+| `BEDROCK_KNOWLEDGE_BASE_ID` | `""` | Bedrock Knowledge Base for qual commentary retrieval. Populated from Terraform's `knowledge_base_id` output; used when the effective data backend is `aws`. |
 | `MODEL_TEMPERATURE_JUDGE` | `0.15` | `compliance_check` temperature. |
 | `MODEL_TEMPERATURE_WORKER` | `0.2` | `quant_data_pull`/`qual_narrative_pull`/`revise_draft` temperature. |
 | `MODEL_TEMPERATURE_SYNTHESIS` | `0.4` | `final_synthesis` temperature. |
@@ -249,42 +252,46 @@ A ready-to-import request collection (health/readiness checks + both scenarios a
 
 ## Running via the Streamlit UI
 
-A browser front-end for the same `POST /api/v1/rfp` endpoint used above — no separate agent
-logic, no direct Ollama/Bedrock access; it's a thin HTTP client over the already-running API
-server, the same way `cli.py` is. **Start the API server first** (see
-[Running via the API](#running-via-the-api)); the UI has nothing to talk to otherwise.
+A browser front-end with **two connection modes**, chosen via a sidebar "Target" radio:
 
-**This cannot test the deployed AgentCore Runtime from Phase 02.** `streamlit_app.py` only ever
-makes a plain `httpx.post` to `{api_base_url}/api/v1/rfp` (a local FastAPI server) — it has no AWS
-SDK usage at all. `invoke_agent_runtime` (see
-[Testing the deployed AgentCore Runtime](#testing-the-deployed-agentcore-runtime-phase-02) below)
-requires an AWS SigV4-signed `boto3` call against a completely different endpoint/contract, which
-this UI does not implement. The closest you can get through this UI to what the deployed Runtime
-does is pointing a **local** API server at the real AWS data backends
-(`$env:DATA_BACKEND = "aws"` plus `MODEL_PROVIDER=bedrock` before `uv run python -m
-amc_orchestrator.main`, per [Switching model provider](#switching-model-provider-ollama-vs-bedrock))
-and running Streamlit against that — still not the containerized Runtime itself, just the same
-DynamoDB/Knowledge Base/Bedrock resources fronted by a locally-running API process instead of
-AgentCore. To test the actual deployed Runtime, use the boto3 script or AWS Console method below.
+- **Local API server** — a thin HTTP client over `POST /api/v1/rfp`, no separate agent logic, the
+  same way `cli.py` is. Requires the API server already running (see
+  [Running via the API](#running-via-the-api) first; the UI has nothing to talk to otherwise).
+- **Deployed AgentCore Runtime (AWS)** — calls the real, deployed Phase 02 Runtime directly via
+  `boto3`'s `invoke_agent_runtime` (SigV4-signed), with **no local server or Ollama involved at
+  all**. This is a genuine alternative to the boto3 script / AWS Console methods in
+  [Testing the deployed AgentCore Runtime](#testing-the-deployed-agentcore-runtime-phase-02) below
+  — added after this guide originally shipped, so if you've used this UI before and remember it
+  being local-only, that's now out of date.
+
+Both modes return the identical `RfpOutcome` JSON shape, so the result view below behaves
+identically regardless of which one produced it.
 
 ```powershell
 # One-time: pull in the UI's extra dependencies (Streamlit, on top of the base install)
 uv sync --group ui
 
-# Terminal 1 - the API server
+# Terminal 1 - only needed for Local API server mode
 uv run python -m amc_orchestrator.main
 
-# Terminal 2 - the UI
+# Terminal 2 - the UI (works standalone in Runtime mode, no Terminal 1 needed)
 uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py
 ```
 
 Opens at `http://localhost:8501`. What's in it:
 
-- **Sidebar** — API base URL (defaults to `http://localhost:8000`, editable if you're pointed at
-  a different host/port), a live API-online / readiness badge (calls `/health` and
-  `/health/ready`, same semantics as [above](#get-healthready)), a request-timeout slider (raise
-  this past the default 600s if you're on Ollama and a query is genuinely still running — see
-  [Troubleshooting](#troubleshooting)), and the mock fund reference table.
+- **Sidebar — Local API server mode**: API base URL (defaults to `http://localhost:8000`,
+  editable if you're pointed at a different host/port), a live API-online / readiness badge (calls
+  `/health` and `/health/ready`, same semantics as [above](#get-healthready)).
+- **Sidebar — Deployed AgentCore Runtime mode**: AWS region and Agent Runtime ARN fields (the ARN
+  is pass 3's `terraform output agent_runtime_arn`), a live "Runtime READY" status badge (calls
+  `bedrock-agentcore-control`'s `get_agent_runtime`), and a reminder that it uses whatever AWS
+  credentials are already active in your environment (`aws configure`, an SSO login, etc.) — the
+  same ones used for `terraform apply`, no separate login step.
+- **Sidebar — both modes**: a request-timeout slider (raise this past the default 600s if you're
+  on Ollama and a query is genuinely still running — see [Troubleshooting](#troubleshooting);
+  Runtime-mode and Bedrock-backed local queries typically finish in well under a minute), and the
+  mock fund reference table.
 - **Main panel** — a dropdown of example queries (one per mock fund, including the SMC3
   high-risk/compliance-loop scenario), an editable question box, and a **Submit RFP** button.
 - **Result view** — an Approved/Escalated status badge, compliance-attempt count, elapsed time,
@@ -292,10 +299,18 @@ Opens at `http://localhost:8501`. What's in it:
 - **Session history** — every query submitted in the current browser session, newest first, so
   you can compare outcomes across runs without re-submitting.
 
-No graph-failure handling is needed in the UI itself — the API route already guarantees a
-well-formed `RfpOutcome` on every call, escalation included (see
-[`POST /api/v1/rfp`](#post-apiv1rfp) above). The UI only surfaces network-level failures
-(API unreachable, request timeout) as user-facing error messages.
+No graph-failure handling is needed in the UI itself — both the API route and the Runtime
+entrypoint already guarantee a well-formed `RfpOutcome` on every call, escalation included (see
+[`POST /api/v1/rfp`](#post-apiv1rfp) above). The UI only surfaces connection-level failures
+(API unreachable, request timeout, missing/invalid AWS credentials, wrong region/ARN) as
+user-facing error messages — distinct exception handling per mode (`httpx.ConnectError`/
+`TimeoutException` for Local; `ClientError`/`BotoCoreError` for Runtime).
+
+**Confirmed working end-to-end via the actual browser UI**, not just `boto3` directly: Playwright
+driving headless Chromium against the real running app confirmed the mode switch reveals the right
+fields, entering a real deployed Runtime ARN shows a genuine "Runtime READY" badge, and submitting
+the INC2 example query in Runtime mode returns a real synthesized report (Approved, 1 compliance
+attempt, 8.3s) rendered correctly through the same result view used by Local mode.
 
 ## Running the tests
 
@@ -458,6 +473,47 @@ All four returned `succeeded=true, escalated=false, graph_status=completed` with
 quant metrics correctly matched to the right ticker and real Knowledge-Base-retrieved commentary
 grounded together, no fabrication — at 7-14 seconds per query, versus Ollama's 5-10+ *minute*
 baseline for the equivalent local query (see [Troubleshooting](#troubleshooting)).
+
+### Tearing an environment down
+
+```powershell
+cd infra/terraform/environments/dev   # or staging / prod
+terraform destroy
+```
+
+**If the environment has actually been used** (a pushed ECR image, ingested Knowledge Base
+documents, ingested OpenSearch vector documents), `terraform destroy` may hit AWS's and the
+OpenSearch community provider's standard "won't delete non-empty resources" safety checks on
+three resources: the ECR repo, the S3 docs bucket, and the `opensearch_index`. `modules/ecr`,
+`modules/s3-kb-docs`, and `modules/opensearch-index` all now set the relevant force-delete flag
+(`force_delete`/`force_destroy = true`), so a **fresh** environment's first-ever destroy should
+not hit this at all.
+
+If you're destroying an environment that was already partway torn down with an *older* version of
+those modules (before the force-delete flags existed in state), a plain `terraform apply` at that
+point is dangerous — it can **recreate** everything already destroyed if `enable_agent_runtime`/
+`enable_knowledge_base` are still `true` in `terraform.tfvars`. In that situation, clear the
+blocking content directly via AWS APIs instead, then re-run `destroy`:
+
+```powershell
+# ECR — delete pushed image digests
+aws ecr batch-delete-image --repository-name <ecr_repository_name> --image-ids imageDigest=<digest>
+
+# S3 (versioning is on — delete_object alone isn't enough) — delete every object version
+aws s3api list-object-versions --bucket <kb_docs_bucket_name>
+aws s3api delete-object --bucket <kb_docs_bucket_name> --key <key> --version-id <version_id>
+
+# OpenSearch Serverless index — AOSS's REST surface is limited (no _delete_by_query/_search
+# without extra setup); a direct SigV4-signed DELETE on the index path works
+curl -X DELETE "https://<collection_endpoint>/kb-default-index" ...  # SigV4-signed
+```
+
+See [`architecture.md`](architecture.md#environment-lifecycle-teardown-and-cost-control) for the
+full account of why this happened once on dev and how it was resolved. After clearing content
+(or on a fresh environment), `terraform destroy` should report `0 added, 0 changed, N destroyed`
+with nothing left behind — confirm with `terraform state list` (empty output means the environment
+is fully torn down; a fresh `terraform apply`, all three passes, is required before using it
+again).
 
 ## Troubleshooting
 

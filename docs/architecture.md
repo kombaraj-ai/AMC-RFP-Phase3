@@ -397,6 +397,66 @@ work described just above. `aws_bedrockagentcore_agent_runtime` itself is still 
 `enable_agent_runtime` (default `false`) until a real image built from the new `Dockerfile` is
 pushed to the ECR repo `modules/ecr` creates — Terraform deliberately never runs `docker build`.
 
+### Testing the deployed Runtime: Streamlit's SigV4-backed Runtime mode
+
+`src/amc_orchestrator/ui/streamlit_app.py` (see "Running via the Streamlit UI" in
+[`user_guide.md`](user_guide.md)) has a sidebar "Target" radio with two modes: `Local API server`
+(the pre-existing thin HTTP client over `POST /api/v1/rfp`) and `Deployed AgentCore Runtime
+(AWS)`. Runtime mode calls `boto3`'s `invoke_agent_runtime` directly, SigV4-signed, with no local
+server involved at all — it uses whatever AWS credentials are already active in the environment
+(the same ones used for `terraform apply`), takes an AWS region + Agent Runtime ARN instead of an
+API base URL, and shows a live status badge via `bedrock-agentcore-control`'s
+`get_agent_runtime` (the runtime id is parsed from the ARN's last path segment). Both modes return
+the identical `RfpOutcome` JSON shape (`runtime_entrypoint.py`'s `invoke()` and the API route both
+return `dataclasses.asdict(outcome)`), so `render_result` needed no changes to handle either.
+
+A genuine Streamlit widget-lifecycle bug was found and fixed while wiring this up, reproduced in
+an isolated script before touching the real file to rule out anything else being the cause: a
+`key`-bound widget (e.g. `st.text_input(..., key="aws_region")`, no explicit `value=`) only
+reliably shows a pre-populated `st.session_state[key]` as its *displayed* value if the widget is
+instantiated on the **same script run** where that default was first set. Since Local mode is the
+default target, the Runtime-only widgets only render for the first time on a **later** rerun
+(after the user switches modes) — Streamlit rendered them blank instead of picking up the
+already-correct session-state value, which surfaced as a real, user-facing `ValueError: Invalid
+endpoint: https://bedrock-agentcore-control..amazonaws.com` (empty region) the first time a real
+Runtime ARN was entered. Fixed by passing `value=` explicitly on all three affected `text_input`s
+(the API base URL field included, defensively, even though it wasn't observed broken — it only
+"worked" by coincidence of being the default-rendered branch).
+
+Verified via Playwright driving headless Chromium against the real running Streamlit app (no
+`chromium-cli` in this environment, so Playwright was installed standalone into the scratchpad and
+driven via a small Node script): default state unchanged, mode switch shows the right fields,
+entering the real deployed Runtime ARN shows a genuine "Runtime READY" badge, and submitting the
+INC2 example query in Runtime mode returned a real synthesized report (Approved, 1 compliance
+attempt, 8.3s) rendered correctly via the existing result view.
+
+### Environment lifecycle: teardown and cost control
+
+`terraform destroy` on a dev environment that has actually been used (a pushed ECR image, ingested
+S3 documents, ingested OpenSearch vector documents) hits AWS's and the OpenSearch community
+provider's standard "won't delete non-empty resources" safety checks — the ECR repo and S3 bucket
+refuse deletion with real AWS "not empty" errors, and `opensearch_index` has its own
+`force_destroy` check. `modules/ecr` (`force_delete = true`), `modules/s3-kb-docs`
+(`force_destroy = true`), and `modules/opensearch-index` (`force_destroy = true`) now set these
+flags so any future destroy of these shared modules — dev, staging, or prod, since all three
+environments share the same modules — won't hit the same blocker.
+
+**Why a plain `terraform apply` to add those flags doesn't retroactively fix an in-progress
+destroy**: `terraform destroy` deletes using each resource's *last-applied state*, not the
+freshly-edited `.tf` config — a code change to a destroy-relevant flag needs an `apply` to land in
+state before a subsequent `destroy` will honor it. On dev, an `apply` at that point would have
+*recreated* the ~30 resources already destroyed earlier in the same run (`enable_agent_runtime`/
+`enable_knowledge_base` were still `true` in tfvars), and a `-target`-scoped apply for just the 3
+resources hit unrelated pre-existing schema drift on the OpenSearch index's `mappings.fields` that
+would have forced a destroy+recreate instead of a clean in-place flag update. Dev was actually
+torn down by clearing the blocking content directly via AWS APIs instead of fighting Terraform's
+incremental-apply semantics: `ecr batch-delete-image` (all pushed digests), S3
+`delete_object_versions` (versioning was on, so a plain `delete_object` wouldn't have been enough),
+and a direct SigV4-signed `DELETE` HTTP call to the AOSS collection endpoint's index path
+(confirmed AOSS's REST API surface is genuinely limited — `_delete_by_query` 404'd, `_search`
+403'd, but `_cat/indices`/`_count`/a direct index `DELETE` all worked). A re-`plan`/`apply` after
+that succeeded clean with the new flags now in state for good.
+
 ## Repository map
 
 ```
