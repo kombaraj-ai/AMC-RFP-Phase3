@@ -332,10 +332,11 @@ one proves.
 ## Deploying to AWS (Phase 02)
 
 Phase 02 provisions the AWS infrastructure for running this system on Amazon Bedrock AgentCore
-(Runtime, Gateway, Memory, DynamoDB, OpenSearch Serverless + Bedrock Knowledge Base, Lambda,
-IAM) via modular Terraform, one root module per environment, plus (as of the app-code follow-on
-task) an AgentCore-compliant entrypoint, a DynamoDB/Bedrock-Knowledge-Base data-layer swap, and a
-`Dockerfile` to actually build the image the Runtime needs.
+(Runtime, Gateway, Memory, DynamoDB, a Bedrock Knowledge Base backed by either OpenSearch
+Serverless or Amazon S3 Vectors, Lambda, IAM) via modular Terraform, one root module per
+environment, plus (as of the app-code follow-on task) an AgentCore-compliant entrypoint, a
+DynamoDB/Bedrock-Knowledge-Base data-layer swap, and a `Dockerfile` to actually build the image
+the Runtime needs.
 
 Full instructions, the three-pass apply flow, and known gotchas (why `PUBLIC` network mode is
 required, why the vector index needs a second pass, the settings mapping the entrypoint now
@@ -405,10 +406,32 @@ mentioned above) — useful background if your own deploy hits the same symptoms
 
 Pass 2 (`enable_knowledge_base = true` + apply) creates the vector index and an empty Knowledge
 Base — real document ingestion is a separate, manual step (Terraform never uploads documents or
-triggers ingestion). This is what actually happened for dev:
+triggers ingestion).
+
+**Which vector store backs the Knowledge Base is controlled by `vector_store_backend`**
+(`environments/<env>/variables.tf`, default `"opensearch"`):
+
+- `"opensearch"` (default; the *only* option in `staging`/`prod` — set anything else there and
+  `terraform plan` fails with a validation error) — Amazon OpenSearch Serverless, via
+  `modules/opensearch-index` and the `opensearch-project/opensearch` community provider. Needs
+  `additional_data_access_principals` set first (see below).
+- `"s3_vectors"` (**dev-only**) — Amazon S3 Vectors, the cheapest vector store Bedrock Knowledge
+  Base supports, via the new `modules/s3-vectors` (a native `hashicorp/aws` resource — no
+  community provider, no `additional_data_access_principals` step needed for this piece). Set
+  `vector_store_backend = "s3_vectors"` in `environments/dev/terraform.tfvars` (already the
+  default there) before this pass. **Note**: the OpenSearch Serverless collection itself is
+  still created in dev either way (other resources depend on it) — this backend only avoids the
+  vector-index/Knowledge-Base-storage cost, not the collection's own baseline cost. See
+  [`architecture.md`](architecture.md#dev-only-vector-store-choice-opensearch-serverless-vs-s3-vectors)
+  for the full trade-off and why it was scoped that way.
+
+Document ingestion (the steps below) is identical regardless of which backend is selected — it
+uploads to the same S3 docs bucket either way. This is what actually happened for dev (on the
+`"opensearch"` backend, before the S3 Vectors option existed):
 
 ```powershell
-# 1. Add your own applier ARN to terraform.tfvars first (see README's pass 2 section), then:
+# 1. (opensearch backend only) Add your own applier ARN to terraform.tfvars first (see README's
+#    pass 2 section), then:
 terraform apply   # creates the vector index + empty Knowledge Base
 
 # 2. Upload documents to the KB's S3 bucket (kb_docs_bucket_name Terraform output)
