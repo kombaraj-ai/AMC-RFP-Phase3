@@ -458,27 +458,47 @@ Runtime, its IAM role, DynamoDB self-seeding (`runtime_entrypoint.py`'s
 `lifespan` hook), and real Bedrock invocation all genuinely work in AWS -
 a real APPROVED completion is expected once pass 2 lands.
 
+- [x] **Pass 2 applied and real document ingestion done, 2026-07-12** -
+      `enable_knowledge_base = true` (`additional_data_access_principals`
+      set to the applier's own ARN, `arn:aws:iam::766354255780:user/eks-admin`,
+      confirmed via `aws sts get-caller-identity` first, per the README's
+      warning). Created: the OpenSearch vector index
+      (`modules/opensearch-index`), the Bedrock Knowledge Base
+      (`5X1FSQTHZG`) + S3 data source (`GDHLU6LSCM`). Hit one transient,
+      not-a-bug issue: the very first apply's `opensearch_index` creation
+      got a 403 (`authorization_exception`) immediately after the AOSS
+      access-policy update in the same apply - AOSS data-access policy
+      propagation lag, not a real error; confirmed the policy was already
+      correct via `get_access_policy`, and a bare re-`plan`/`apply` (3 to
+      add, 1 to change - the policy/Lambda changes had already landed)
+      succeeded clean. **Real document ingestion**: uploaded the same 4
+      mock-fund commentary texts `chroma_store.py` already seeds into
+      Chroma (`doc_eqg1`/`doc_smc3`/`doc_inc2`/`doc_bln4`) as `.txt` files
+      to the KB's S3 bucket, `start_ingestion_job` - `COMPLETE`, `4
+      scanned, 4 indexed, 0 failed`. **Final live re-verification**: the
+      exact same INC2 `invoke_agent_runtime` call now returns
+      `succeeded=true, escalated=false, graph_status=completed,
+      compliance_attempts=3` with a real synthesized report (real NAV/
+      Alpha/Beta/Sharpe/etc. from DynamoDB plus real manager commentary
+      retrieved from the Knowledge Base) - the first genuine APPROVED
+      end-to-end completion of the deployed AgentCore Runtime, not just a
+      graceful escalation.
+
 ### Immediate next step (resume here)
 
-1. Pass 2: `enable_knowledge_base = true` in
-   `infra/terraform/environments/dev/terraform.tfvars` (after adding the
-   applier's principal to `additional_data_access_principals`), apply -
-   creates the vector index + real Bedrock Knowledge Base. Real document
-   ingestion (S3 upload + `start_ingestion_job`) is a further, separate
-   step after that - needed before a real APPROVED completion is possible
-   end-to-end.
-2. Re-run the same `invoke_agent_runtime` smoke test after pass 2 +
-   ingestion to confirm a real compliant synthesized report, not just the
-   escalation path.
-3. Staging/prod applies (all three real bugs above are dev-tfvars-only
-   fixes so far - `environments/staging/`/`environments/prod/` still
-   reference the same end-of-life Claude model ID and will need the same
-   `bedrock_model_id`/IAM update before their eventual first apply,
+1. Staging/prod applies (all three deploy bugs found this session were
+   dev-tfvars-only fixes so far - `environments/staging/`/`environments/prod/`
+   still reference the same end-of-life Claude model ID and will need the
+   same `bedrock_model_id`/IAM update before their eventual first apply,
    though they don't have the `MODEL_PROVIDER` issue since
-   `environment != "dev"` already forces Bedrock for them).
-4. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
+   `environment != "dev"` already forces Bedrock for them). Staging/prod
+   will also need their own document ingestion pass once applied - the 4
+   mock-fund commentary texts aren't Terraform-managed, they were a manual
+   `aws s3 cp` + `start_ingestion_job` this session, so nothing propagates
+   automatically.
+2. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
    integration.
-5. **Uncommitted work**: `git status` shows the Terraform/app-code files
+3. **Uncommitted work**: `git status` shows the Terraform/app-code files
    from this phase plus this session's Dockerfile/dev-tfvars fixes, not yet
    committed (Phase 01's convention is one commit per milestone - worth
    committing in logical chunks rather than one giant commit, but wasn't

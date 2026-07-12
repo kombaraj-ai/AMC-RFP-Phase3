@@ -3,7 +3,7 @@ project     = "amc-orchestrator"
 environment = "dev"
 
 # --- Phased-apply gates: leave both false on the first apply -------------
-enable_knowledge_base = false
+enable_knowledge_base = true
 enable_agent_runtime  = true
 container_image_uri   = "766354255780.dkr.ecr.us-east-1.amazonaws.com/amc-orchestrator-dev-agent-runtime:v1"
 
@@ -30,7 +30,8 @@ bedrock_model_id = "amazon.nova-lite-v1:0"
 embedding_model  = "titan-v2"
 runtime_protocol = "HTTP"
 
-# Add the ARN of whoever/whatever runs `terraform apply` here before the
-# enable_knowledge_base=true pass, or vector-index creation will fail with
-# an AOSS authorization error - see README.md.
-additional_data_access_principals = []
+# The applier's own ARN - AOSS data-plane access is gated by its own access
+# policy (modules/opensearch-access-policy), not just IAM permissions;
+# without this, vector-index creation fails with an AOSS authorization
+# error. Confirmed via `aws sts get-caller-identity`, 2026-07-12.
+additional_data_access_principals = ["arn:aws:iam::766354255780:user/eks-admin"]
