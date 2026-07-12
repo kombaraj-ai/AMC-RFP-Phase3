@@ -71,6 +71,14 @@ observability (log groups/dashboard/alarms).
 
 ### Pass 2 — vector index + Knowledge Base
 
+Which vector store backs the Knowledge Base is controlled by
+`var.vector_store_backend` (`"opensearch"` or `"s3_vectors"`) -
+`environments/staging` and `environments/prod` hard-lock this to
+`"opensearch"` (validation error if you try to change it); only
+`environments/dev` can opt into `"s3_vectors"` for cost.
+
+**`vector_store_backend = "opensearch"` (default, required in staging/prod):**
+
 AWS OpenSearch Serverless has no native Terraform index resource in
 `hashicorp/aws` (confirmed against the AWS-authored "Deploy Amazon
 OpenSearch Serverless with Terraform" blog post, which stops at
@@ -85,14 +93,31 @@ access is gated by its own access policy (created in pass 1 from
 `modules/iam`'s role list plus this variable), not just IAM permissions.
 Without it, index creation fails with an AOSS authorization error.
 
+**`vector_store_backend = "s3_vectors"` (dev-only, cheapest option):**
+
+`modules/s3-vectors` creates an S3 Vectors bucket + index directly via
+`hashicorp/aws` (`aws_s3vectors_vector_bucket`/`aws_s3vectors_index`,
+landed in provider `>= 6.27.0`) - a native resource, so unlike the
+OpenSearch path there's no community provider and no
+`additional_data_access_principals` step needed for this piece. Note:
+the OpenSearch Serverless *collection* itself is still created in pass 1
+regardless of this setting (it has other, unrelated consumers) - this
+backend only skips the vector-index/KB-storage cost, not the collection's
+baseline cost. See `docs/architecture.md`'s "Environment lifecycle:
+teardown and cost control" section for the full trade-off.
+
 ```powershell
-# after editing terraform.tfvars: additional_data_access_principals + enable_knowledge_base = true
+# after editing terraform.tfvars: enable_knowledge_base = true, plus
+# (opensearch backend only) additional_data_access_principals
 terraform apply
 ```
 
-Creates: the vector index (`modules/opensearch-index`) and the Bedrock
-Knowledge Base + S3 data source (`modules/knowledge-base`), empty -
-document ingestion is a separate, later step, not part of this Terraform.
+Creates: the vector index (`modules/opensearch-index` or `modules/s3-vectors`,
+whichever `vector_store_backend` selects) and the Bedrock Knowledge Base +
+S3 data source (`modules/knowledge-base`), empty - document ingestion is a
+separate, later step, not part of this Terraform, and is identical
+regardless of which vector-store backend was chosen (it uploads to the same
+S3 docs bucket either way).
 
 ### Pass 3 — the agent runtime itself
 
@@ -135,6 +160,14 @@ terraform apply
 - **`terraform plan`/`apply` need real AWS credentials and the bootstrap
   bucket to exist.** `terraform validate` (schema/type checking, no
   credentials needed) is what CI or a quick sanity check should run instead.
+- **S3 Vectors' exact IAM action names and IAM/data-type/distance-metric
+  values are not independently verified against an authoritative AWS
+  source** (`modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane`
+  statement, `modules/s3-vectors/variables.tf`'s `data_type`/
+  `distance_metric` defaults) - taken from AWS's own reference examples,
+  flagged in both files' comments. Confirm against AWS's Service
+  Authorization Reference before relying on this outside of dev
+  experimentation.
 
 ## Settings mapping (handoff to the app-code follow-on task)
 

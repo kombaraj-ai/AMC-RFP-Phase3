@@ -616,6 +616,45 @@ a real APPROVED completion is expected once pass 2 lands.
    committing in logical chunks rather than one giant commit, but wasn't
    asked to do so yet this session).
 
+**Post-teardown addition (2026-07-12): dev-only S3 Vectors vector-store
+option added.** `environments/dev/variables.tf`'s new `vector_store_backend`
+(`"opensearch"` default, or `"s3_vectors"`) lets dev opt into a new
+`modules/s3-vectors` module (`aws_s3vectors_vector_bucket`/
+`aws_s3vectors_index`, confirmed to exist by running `terraform providers
+schema -json` against the real installed `hashicorp/aws` v6.54.0 provider
+in `environments/dev` - not trusted from the reference blog post alone,
+same M0 precedent as always) instead of the OpenSearch
+index/collection-storage path, as a cheaper option for a disposable,
+frequently-torn-down environment. `environments/staging`/`environments/prod`
+hard-lock the variable to `"opensearch"` via a `validation` block (a loud
+plan-time error beats a silent override at the infra layer, unlike
+`Settings.effective_model_provider`'s app-layer pattern).
+
+Deliberately minimal blast radius, confirmed with the user before
+implementing: only `modules/opensearch-index`'s count and
+`modules/knowledge-base`'s `storage_configuration` block (now `dynamic`,
+picking `OPENSEARCH_SERVERLESS` vs `S3_VECTORS`) became
+backend-conditional; `modules/opensearch-serverless`,
+`modules/opensearch-access-policy`, the `opensearch` provider block, and
+`modules/lambda-tools`' unrelated OpenSearch env var are untouched. Real
+consequence: the OpenSearch Serverless collection itself still gets
+created in dev even when `s3_vectors` is selected (it has other
+consumers), so this saves the vector-index/KB-storage cost, not the
+collection's own baseline cost - a documented trade-off, not an oversight
+(full collection-level gating was scoped out as a separate follow-up, it
+would touch 5 files unrelated to the KB plus one unverified Terraform
+provider-block behavior). Two narrow unknowns are flagged in code
+comments rather than silently assumed: the exact `s3vectors:*` IAM action
+names on the new `S3VectorsDataPlane` statement
+(`modules/iam/knowledge_base_role.tf`) and the `data_type`/
+`distance_metric` values (`modules/s3-vectors/variables.tf`) - both taken
+from AWS's own reference examples, not yet checked against AWS's Service
+Authorization Reference. **Not yet applied to real AWS** - `terraform
+fmt`/`validate` plus a `terraform plan` dry run (staging/prod must show
+zero changes; dev should plan to create `module.s3_vectors` and skip
+`module.opensearch_index`) is the next verification step before dev's
+fresh 3-pass apply (item 1 above).
+
 Provisions every AWS resource the deployed system needs (AgentCore
 Runtime/Gateway/Memory, ECR, DynamoDB, OpenSearch Serverless + Bedrock
 Knowledge Base, Lambda tool stubs, IAM, observability) via modular

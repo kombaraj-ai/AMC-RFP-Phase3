@@ -25,6 +25,17 @@ variable "enable_knowledge_base" {
   default     = false
 }
 
+variable "vector_store_backend" {
+  description = "Vector store backing the Bedrock Knowledge Base. Hard-locked to \"opensearch\" in this root module - \"s3_vectors\" is a dev-only cost optimization; see environments/dev/variables.tf."
+  type        = string
+  default     = "opensearch"
+
+  validation {
+    condition     = var.vector_store_backend == "opensearch"
+    error_message = "This root module only supports \"opensearch\" - \"s3_vectors\" is dev-only. See environments/dev/variables.tf."
+  }
+}
+
 variable "enable_agent_runtime" {
   description = "Set true only after a real image has been pushed to the ECR repo this stack creates. See var.container_image_uri."
   type        = bool

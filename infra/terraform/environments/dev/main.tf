@@ -49,6 +49,7 @@ module "iam" {
   account_id                        = data.aws_caller_identity.current.account_id
   dynamodb_table_arn                = module.dynamodb.table_arn
   opensearch_collection_arn         = module.opensearch_serverless.collection_arn
+  s3_vectors_bucket_arn             = var.enable_knowledge_base && var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].vector_bucket_arn : ""
   kb_docs_bucket_arn                = module.s3_kb_docs.bucket_arn
   ecr_repository_arn                = module.ecr.repository_arn
   bedrock_model_arns                = local.bedrock_model_arns
@@ -80,9 +81,13 @@ module "lambda_tools" {
 }
 
 # --- Phase 2: vector index + knowledge base (see var.enable_knowledge_base) -
+# vector_store_backend picks exactly one of the next two modules - see
+# environments/dev/variables.tf and docs/architecture.md's "Environment
+# lifecycle" section for why dev can opt into the cheaper S3 Vectors backend
+# while staging/prod stay OpenSearch-only.
 module "opensearch_index" {
   source = "../../modules/opensearch-index"
-  count  = var.enable_knowledge_base ? 1 : 0
+  count  = var.enable_knowledge_base && var.vector_store_backend == "opensearch" ? 1 : 0
 
   providers = {
     opensearch = opensearch
@@ -93,6 +98,17 @@ module "opensearch_index" {
   depends_on = [module.opensearch_access_policy]
 }
 
+module "s3_vectors" {
+  source = "../../modules/s3-vectors"
+  count  = var.enable_knowledge_base && var.vector_store_backend == "s3_vectors" ? 1 : 0
+
+  name_prefix         = local.name_prefix
+  account_id          = data.aws_caller_identity.current.account_id
+  embedding_dimension = 1024
+  use_cmk             = var.use_cmk
+  tags                = local.common_tags
+}
+
 module "knowledge_base" {
   source = "../../modules/knowledge-base"
   count  = var.enable_knowledge_base ? 1 : 0
@@ -101,11 +117,15 @@ module "knowledge_base" {
   aws_region                = var.aws_region
   knowledge_base_role_arn   = module.iam.knowledge_base_role_arn
   docs_bucket_arn           = module.s3_kb_docs.bucket_arn
+  vector_store_backend      = var.vector_store_backend
   opensearch_collection_arn = module.opensearch_serverless.collection_arn
+  s3_vectors_bucket_arn     = var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].vector_bucket_arn : ""
+  s3_vectors_index_arn      = var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].index_arn : ""
+  s3_vectors_index_name     = var.vector_store_backend == "s3_vectors" ? module.s3_vectors[0].index_name : ""
   embedding_model           = var.embedding_model
   tags                      = local.common_tags
 
-  depends_on = [module.opensearch_index]
+  depends_on = [module.opensearch_index, module.s3_vectors]
 }
 
 # --- Phase 3: agent runtime (see var.enable_agent_runtime) ----------------

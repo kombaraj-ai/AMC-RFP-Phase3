@@ -25,6 +25,17 @@ variable "enable_knowledge_base" {
   default     = false
 }
 
+variable "vector_store_backend" {
+  description = "Vector store backing the Bedrock Knowledge Base: \"opensearch\" (Amazon OpenSearch Serverless) or \"s3_vectors\" (Amazon S3 Vectors - cheapest, dev-only). Only affects the vector index / KB storage resources - the OpenSearch Serverless collection itself is still created either way (see docs/architecture.md's \"Environment lifecycle\" section)."
+  type        = string
+  default     = "opensearch"
+
+  validation {
+    condition     = contains(["opensearch", "s3_vectors"], var.vector_store_backend)
+    error_message = "vector_store_backend must be \"opensearch\" or \"s3_vectors\"."
+  }
+}
+
 variable "enable_agent_runtime" {
   description = "Set true only after a real image has been pushed to the ECR repo this stack creates. See var.container_image_uri."
   type        = bool

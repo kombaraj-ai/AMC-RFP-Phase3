@@ -46,6 +46,32 @@ data "aws_iam_policy_document" "kb_permissions" {
     actions   = ["aoss:APIAccessAll"]
     resources = [var.opensearch_collection_arn]
   }
+
+  # S3 Vectors data-plane access (dev-only backend, see
+  # environments/dev/variables.tf's vector_store_backend). Action list taken
+  # from AWS's own S3-Vectors-for-Bedrock reference examples, NOT
+  # independently verified against AWS's Service Authorization Reference
+  # (docs.aws.amazon.com/service-authorization/latest/reference/list_amazons3vectors.html)
+  # - confirm there before relying on this outside of dev experimentation,
+  # per this project's own precedent (CLAUDE.md's M0 note) of verifying
+  # against real sources rather than blog posts.
+  dynamic "statement" {
+    for_each = var.s3_vectors_bucket_arn != "" ? [1] : []
+    content {
+      sid    = "S3VectorsDataPlane"
+      effect = "Allow"
+      actions = [
+        "s3vectors:GetVector",
+        "s3vectors:PutVector",
+        "s3vectors:DeleteVector",
+        "s3vectors:QueryVectors",
+        "s3vectors:ListVectors",
+        "s3vectors:GetIndex",
+        "s3vectors:ListIndexes",
+      ]
+      resources = [var.s3_vectors_bucket_arn, "${var.s3_vectors_bucket_arn}/*"]
+    }
+  }
 }
 
 resource "aws_iam_role_policy" "knowledge_base" {

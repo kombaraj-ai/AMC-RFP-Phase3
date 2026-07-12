@@ -7,6 +7,12 @@ enable_knowledge_base = true
 enable_agent_runtime  = true
 container_image_uri   = "766354255780.dkr.ecr.us-east-1.amazonaws.com/amc-orchestrator-dev-agent-runtime:v1"
 
+# Cheapest option for dev - avoids the OpenSearch vector-index/KB-storage cost.
+# The OpenSearch Serverless collection itself is still created (see
+# docs/architecture.md's "Environment lifecycle" section) - full collection-level
+# savings are a deliberately deferred follow-up. Not valid in staging/prod.
+vector_store_backend = "s3_vectors"
+
 # --- Cost/HA knobs - cheapest sensible dev defaults -----------------------
 use_cmk                         = false
 opensearch_standby_replicas     = "DISABLED"

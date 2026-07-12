@@ -21,6 +21,12 @@ variable "opensearch_collection_arn" {
   type        = string
 }
 
+variable "s3_vectors_bucket_arn" {
+  description = "ARN of the S3 Vectors bucket (modules/s3-vectors' vector_bucket_arn output), when the dev-only vector_store_backend = \"s3_vectors\" is selected. Empty string when unused - gates the S3VectorsDataPlane IAM statement in knowledge_base_role.tf."
+  type        = string
+  default     = ""
+}
+
 variable "kb_docs_bucket_arn" {
   description = "ARN of the S3 bucket holding Knowledge Base source documents."
   type        = string

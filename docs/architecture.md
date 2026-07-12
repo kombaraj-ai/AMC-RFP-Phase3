@@ -311,8 +311,8 @@ the app for ECR.
 | Tool exposure | `aws_bedrockagentcore_gateway` + one `gateway_target` per tool, IAM-auth'd | `agentcore-gateway` |
 | Conversation memory | `aws_bedrockagentcore_memory` + a semantic strategy scoped per session | `agentcore-memory` |
 | Quant metrics | DynamoDB, `PAY_PER_REQUEST`, `ticker` as the sole key — mirrors `sqlite_store.py`'s schema | `dynamodb` |
-| Qual vector store | OpenSearch Serverless collection (`VECTORSEARCH`) + its security/access policies | `opensearch-serverless`, `opensearch-access-policy` |
-| Qual RAG | Bedrock Knowledge Base + S3 data source, backed by the collection above | `knowledge-base`, `s3-kb-docs` |
+| Qual vector store | OpenSearch Serverless collection (`VECTORSEARCH`) + its security/access policies (staging/prod always; dev's default) — or, dev-only, an S3 Vectors bucket + index (`vector_store_backend = "s3_vectors"`, see below) | `opensearch-serverless`, `opensearch-access-policy`, `opensearch-index` — or `s3-vectors` |
+| Qual RAG | Bedrock Knowledge Base + S3 data source, backed by whichever vector store above is selected | `knowledge-base`, `s3-kb-docs` |
 | Tool compute | Stub Lambda functions behind the Gateway targets (placeholder logic — see below) | `lambda-tools` |
 | Container registry | ECR repo for the runtime's image (Terraform never builds/pushes into it) | `ecr` |
 | Access control | One IAM role per AWS-service consumer (runtime, gateway, lambda, knowledge base) | `iam` |
@@ -345,6 +345,44 @@ the app for ECR.
    data-access policy needs those same roles' ARNs as its `Principal` list. Resolved by splitting
    the access policy into its own `modules/opensearch-access-policy`, applied after both `iam` and
    `opensearch-serverless` — a deliberate module boundary, not an accident of ordering.
+
+### Dev-only vector store choice: OpenSearch Serverless vs. S3 Vectors
+
+`environments/dev/variables.tf`'s `vector_store_backend` (`"opensearch"` default, or
+`"s3_vectors"`) lets dev opt into Amazon S3 Vectors — a much cheaper, natively
+Terraform-manageable vector store (`aws_s3vectors_vector_bucket`/`aws_s3vectors_index`,
+`modules/s3-vectors`) — as an alternative to the OpenSearch-index/Knowledge-Base-storage path
+above, without touching the OpenSearch modules themselves. `environments/staging`/`environments/prod`
+hard-lock this variable to `"opensearch"` (a `validation` block, not a silent override — see
+below) since that's the right choice for production traffic.
+
+**Deliberately minimal blast radius**: only `modules/opensearch-index` and the Knowledge Base's
+`storage_configuration` block become backend-conditional (via `dynamic` blocks in
+`modules/knowledge-base/main.tf`, gated on `vector_store_backend`); `modules/opensearch-serverless`,
+`modules/opensearch-access-policy`, the `opensearch` Terraform provider block, and
+`modules/lambda-tools`' (unrelated) OpenSearch endpoint input are all untouched and still
+unconditional. **Concrete consequence**: choosing `"s3_vectors"` in dev still creates the
+OpenSearch Serverless collection (it has other consumers), so this only eliminates the
+vector-index/KB-storage cost, not the collection's own baseline cost — a deliberate trade-off
+for a smaller, lower-risk change over full collection-level savings, which would need to touch
+five files unrelated to the Knowledge Base and one Terraform behavior (a count-conditional
+module reference inside a `provider` block) that isn't yet empirically verified. See
+`infra/terraform/README.md`'s "Pass 2" section for the operational side of this.
+
+**Why a `validation` block in staging/prod, not a silent `effective_*` override**: unlike
+`Settings.effective_model_provider`/`effective_data_backend` (app-layer, DEV-respects/
+STAGING-PROD-forces), an infra operator who explicitly sets `vector_store_backend = "s3_vectors"`
+in `staging/terraform.tfvars` and gets silently overridden back to OpenSearch would have no way
+to know their intent was ignored — a loud `terraform plan` validation error is the safer failure
+mode at this layer.
+
+**Two implementation details are flagged, not silently assumed**: the exact `s3vectors:*` IAM
+action names (`modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane` statement) and the
+`data_type`/`distance_metric` values (`modules/s3-vectors/variables.tf`) were taken from AWS's
+own S3-Vectors-for-Bedrock reference examples, not independently verified against AWS's Service
+Authorization Reference or Bedrock integration docs — both files carry an explicit comment to
+that effect, consistent with this project's own M0 precedent of verifying claims against real
+sources rather than trusting a single reference.
 
 ### The app-code follow-on: AgentCore entrypoint + DynamoDB/Knowledge Base data layer
 
@@ -431,6 +469,13 @@ INC2 example query in Runtime mode returned a real synthesized report (Approved,
 attempt, 8.3s) rendered correctly via the existing result view.
 
 ### Environment lifecycle: teardown and cost control
+
+Beyond teardown, dev can also opt into a cheaper vector store while it's running —
+`vector_store_backend = "s3_vectors"` (see "Dev-only vector store choice" above) avoids the
+OpenSearch vector-index/Knowledge-Base-storage cost, though not the OpenSearch Serverless
+collection's own baseline cost, which stays regardless. `modules/s3-vectors` was itself built
+teardown-friendly from day one (`force_destroy = true` on the vector bucket) specifically so it
+doesn't repeat the class of bug described next.
 
 `terraform destroy` on a dev environment that has actually been used (a pushed ECR image, ingested
 S3 documents, ingested OpenSearch vector documents) hits AWS's and the OpenSearch community

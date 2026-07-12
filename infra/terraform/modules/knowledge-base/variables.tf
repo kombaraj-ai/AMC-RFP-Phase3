@@ -14,14 +14,43 @@ variable "docs_bucket_arn" {
   type = string
 }
 
+variable "vector_store_backend" {
+  description = "Which storage_configuration block to render: \"opensearch\" or \"s3_vectors\". Must match environments/*/variables.tf's var.vector_store_backend exactly."
+  type        = string
+
+  validation {
+    condition     = contains(["opensearch", "s3_vectors"], var.vector_store_backend)
+    error_message = "vector_store_backend must be \"opensearch\" or \"s3_vectors\"."
+  }
+}
+
 variable "opensearch_collection_arn" {
-  type = string
+  type    = string
+  default = ""
 }
 
 variable "vector_index_name" {
-  description = "Must match modules/opensearch-index's var.index_name exactly - the index is created out-of-band by that module in a second apply pass, this resource only references it by name."
+  description = "Must match modules/opensearch-index's var.index_name exactly - the index is created out-of-band by that module in a second apply pass, this resource only references it by name. Only used when vector_store_backend = \"opensearch\"."
   type        = string
   default     = "kb-default-index"
+}
+
+variable "s3_vectors_bucket_arn" {
+  description = "modules/s3-vectors' vector_bucket_arn output. Only used when vector_store_backend = \"s3_vectors\"."
+  type        = string
+  default     = ""
+}
+
+variable "s3_vectors_index_arn" {
+  description = "modules/s3-vectors' index_arn output. Only used when vector_store_backend = \"s3_vectors\"."
+  type        = string
+  default     = ""
+}
+
+variable "s3_vectors_index_name" {
+  description = "modules/s3-vectors' index_name output. Only used when vector_store_backend = \"s3_vectors\"."
+  type        = string
+  default     = ""
 }
 
 variable "vector_field" {
