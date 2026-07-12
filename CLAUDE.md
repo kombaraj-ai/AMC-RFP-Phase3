@@ -725,12 +725,24 @@ with concrete values a real apply produces:
    separate non-blocking question.
 
 `terraform validate` re-confirmed clean on all three environments after
-both fixes. Dev's re-apply was still in progress as of this log entry (not
-yet confirmed all the way through to a live, `APPROVED` end-to-end query
-like the original Phase 02 deploy achieved) - resume by re-running
-`terraform apply` in `environments/dev`, which should proceed from the
-already-created resources (Memory, DynamoDB, ECR, S3 docs bucket, IAM,
-Lambda stubs, S3 Vectors bucket+index) rather than recreating them.
+both fixes. **Dev's re-apply completed successfully** (all three passes -
+`enable_agent_runtime` was temporarily set `false` for pass 1/2, a fresh
+image built/pushed to the recreated ECR repo, then flipped back `true` for
+pass 3) - `terraform output` confirmed `opensearch_collection_arn`/
+`opensearch_collection_endpoint` both empty, live proof of zero OpenSearch
+resources. The 4 mock-fund commentary docs were re-uploaded to the S3 docs
+bucket and ingested cleanly (4 scanned, 4 indexed, 0 failed - same texts as
+`chroma_store.py`'s `_MOCK_COMMENTARY`, see that file for the exact
+content). **Full live end-to-end proof, via `boto3`'s `invoke_agent_runtime`
+(the AWS CLI installed here is still too old for `bedrock-agentcore`
+commands, per the existing note in `docs/user_guide.md`)**: the INC2 query
+returned `succeeded=true, escalated=false, compliance_attempts=1,
+graph_status=completed`, with real DynamoDB quant metrics (NAV $52.10,
+Beta 0.35, etc.) and real S3-Vectors-Knowledge-Base-retrieved commentary
+("reduced duration risk... central bank updates... exceptionally low Beta
+of 0.35" - an exact match to the uploaded `doc_inc2.txt` text) - the first
+genuine APPROVED completion proving the whole S3 Vectors backend works
+end-to-end in AWS, not just that Terraform applied cleanly.
 
 Provisions every AWS resource the deployed system needs (AgentCore
 Runtime/Gateway/Memory, ECR, DynamoDB, OpenSearch Serverless + Bedrock
