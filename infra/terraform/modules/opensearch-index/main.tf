@@ -12,8 +12,9 @@
 # which is exactly the chicken-and-egg this second-pass apply works around.
 
 resource "opensearch_index" "kb_vector_index" {
-  name      = var.index_name
-  index_knn = true
+  name          = var.index_name
+  index_knn     = true
+  force_destroy = true
 
   mappings = jsonencode({
     properties = {

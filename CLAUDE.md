@@ -553,21 +553,64 @@ a real APPROVED completion is expected once pass 2 lands.
       via the existing result view - screenshotted at each step, zero
       console errors.
 
+- [x] **Dev environment fully torn down, 2026-07-12** - user-initiated
+      `terraform destroy`. Hit exactly the AWS-standard "won't delete
+      non-empty resources" safety checks on three resources that held real
+      content from this session's testing: the ECR repo (pushed images),
+      the S3 docs bucket (4 ingested commentary files), and the
+      `opensearch_index` (4 ingested vector documents) - ECR/S3 with the
+      real AWS "not empty" errors, the OpenSearch community provider with
+      its own `force_destroy` check. **Root cause of the first retry also
+      failing after adding `force_delete`/`force_destroy = true` to the
+      three modules** (`modules/ecr/main.tf`, `modules/s3-kb-docs/main.tf`,
+      `modules/opensearch-index/main.tf` - now committed, so this is fixed
+      for good on any future destroy, dev/staging/prod all share these
+      modules): `terraform destroy` deletes using each resource's
+      **last-applied state**, not the freshly-edited `.tf` config - a code
+      change to a destroy-relevant flag needs an `apply` to actually land
+      in state before a subsequent `destroy` will honor it. A plain
+      `terraform apply` at that point would have **recreated** the ~30
+      resources already destroyed earlier in the same run (`enable_agent_runtime`/
+      `enable_knowledge_base` were still `true` in tfvars) - the opposite of
+      what was wanted - and a `-target`-scoped apply just for the 3
+      resources hit unrelated pre-existing schema drift on the OpenSearch
+      index's `mappings.fields` that would have forced a destroy+recreate
+      instead of a clean in-place flag update. **Resolved by clearing the
+      content directly via AWS APIs instead of fighting Terraform's
+      incremental-apply semantics**: `ecr batch-delete-image` (all 3
+      digests), S3 `delete_object_versions` (versioning was on, so plain
+      `delete_object` wouldn't have been enough - 4 versions deleted), and
+      a direct SigV4-signed `DELETE` HTTP call to the AOSS collection
+      endpoint's `/kb-default-index` (confirmed AOSS's REST API surface is
+      genuinely limited - `_delete_by_query` 404'd, `_search` 403'd, but
+      `_cat/indices`/`_count`/a direct index `DELETE` all worked; deleting
+      the index outright was actually the correct move anyway, since the
+      goal was removing it, not just its documents). Re-`plan`/`apply`
+      after that succeeded clean: `0 added, 0 changed, 9 destroyed`.
+      **`terraform state list` now empty** - dev has zero AWS resources
+      left; a fresh `terraform apply` (all 3 passes, per this doc's
+      "Per-environment apply" flow) is required before any further
+      dev-environment work in a future session.
+
 ### Immediate next step (resume here)
 
-1. Staging/prod applies (all three deploy bugs found this session were
-   dev-tfvars-only fixes so far - `environments/staging/`/`environments/prod/`
+1. Re-apply dev from scratch (all 3 passes - pass 1, then pass 2 with
+   `enable_knowledge_base = true` + document re-ingestion, then pass 3 with
+   `enable_agent_runtime = true` + a fresh `docker build`/`push`, since the
+   image was deleted along with everything else) before any further
+   dev-environment testing - there is currently nothing deployed.
+2. Staging/prod applies (all three deploy bugs found earlier this session
+   were dev-tfvars-only fixes so far - `environments/staging/`/`environments/prod/`
    still reference the same end-of-life Claude model ID and will need the
    same `bedrock_model_id`/IAM update before their eventual first apply,
    though they don't have the `MODEL_PROVIDER` issue since
    `environment != "dev"` already forces Bedrock for them). Staging/prod
    will also need their own document ingestion pass once applied - the 4
    mock-fund commentary texts aren't Terraform-managed, they were a manual
-   `aws s3 cp` + `start_ingestion_job` this session, so nothing propagates
-   automatically.
-2. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
+   `aws s3 cp` + `start_ingestion_job`, so nothing propagates automatically.
+3. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
    integration.
-3. **Uncommitted work**: `git status` shows the Terraform/app-code files
+4. **Uncommitted work**: `git status` shows the Terraform/app-code files
    from this phase plus this session's Dockerfile/dev-tfvars fixes, not yet
    committed (Phase 01's convention is one commit per milestone - worth
    committing in logical chunks rather than one giant commit, but wasn't

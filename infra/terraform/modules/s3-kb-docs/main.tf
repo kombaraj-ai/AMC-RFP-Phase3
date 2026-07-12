@@ -17,8 +17,9 @@ resource "aws_kms_alias" "docs" {
 }
 
 resource "aws_s3_bucket" "docs" {
-  bucket = local.bucket_name
-  tags   = var.tags
+  bucket        = local.bucket_name
+  force_destroy = true
+  tags          = var.tags
 }
 
 resource "aws_s3_bucket_versioning" "docs" {
