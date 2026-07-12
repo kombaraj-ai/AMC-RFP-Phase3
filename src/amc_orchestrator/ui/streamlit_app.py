@@ -1,30 +1,47 @@
 """Streamlit front-end for the AMC RFP & Portfolio Insight Orchestrator.
 
-A thin HTTP client over the FastAPI layer (`api/routes/rfp.py`) - it never
-imports `workflows.graph_build` or talks to Ollama/Bedrock directly, the same
-way `cli.py` and the API route are the only two callers of the graph. This
-means the API server must already be running (`uv run python -m
-amc_orchestrator.main`) before this app is launched.
+Two connection modes, selected in the sidebar:
 
-No graph-failure handling is needed here beyond network/HTTP errors: the API
-route already applies the try/except-around-`graph(...)` safety net (see
-CLAUDE.md "Bug #2") and always returns a well-formed `RfpOutcome` with HTTP
-200, even on escalation. Only connection/timeout errors are this layer's
-problem.
+- **Local API server**: a thin HTTP client over the FastAPI layer
+  (`api/routes/rfp.py`) - no separate agent logic, no direct Ollama/Bedrock
+  access, the same way `cli.py` and the API route are the only two callers
+  of the graph. Requires the API server already running (`uv run python -m
+  amc_orchestrator.main`).
+- **Deployed AgentCore Runtime (AWS)**: calls the real, deployed Phase 02
+  Runtime directly via `boto3`'s `invoke_agent_runtime` (SigV4-signed,
+  no local server involved at all) - uses whatever AWS credentials are
+  already active in this environment, the same ones used for
+  `terraform apply`. Both modes return the exact same `RfpOutcome` JSON
+  shape (`runtime_entrypoint.py`'s `invoke()` and the API route both return
+  `dataclasses.asdict(outcome)`), so `render_result` never needs to know
+  which mode produced it.
+
+No graph-failure handling is needed here beyond network/HTTP/AWS errors: the
+API route and the Runtime entrypoint both already apply the
+try/except-around-`graph(...)` safety net (see CLAUDE.md "Bug #2") and
+always return a well-formed `RfpOutcome`, even on escalation. Only
+connection/timeout/credential errors are this layer's problem.
 
 Run with: `uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py`
 """
 
 from __future__ import annotations
 
+import json
 import time
 from datetime import datetime
 from typing import Any
 
+import boto3
 import httpx
 import streamlit as st
+from botocore.config import Config as BotoConfig
+from botocore.exceptions import BotoCoreError, ClientError
 
 from amc_orchestrator.config.settings import get_settings
+
+LOCAL_MODE = "Local API server"
+RUNTIME_MODE = "Deployed AgentCore Runtime (AWS)"
 
 # Status palette (fixed, never themed - see dataviz skill's palette.md).
 # Paired with an icon + label everywhere it's used, so status is never
@@ -70,10 +87,33 @@ def fetch_json(base_url: str, path: str, timeout: float = 3.0) -> dict[str, Any]
         return None
 
 
+def fetch_runtime_status(region: str, arn: str) -> dict[str, Any] | None:
+    """Check the deployed Runtime's real status via the control-plane API.
+
+    `get_agent_runtime` takes an id, not the ARN `invoke_agent_runtime` uses -
+    the id is just the ARN's last path segment (confirmed against a real
+    Phase 02 deployment, e.g. `.../runtime/amc_orchestrator_dev_agent_runtime-X1c5y89vze`).
+    """
+    if not arn.strip():
+        return None
+    runtime_id = arn.rsplit("/", 1)[-1]
+    try:
+        client = boto3.client("bedrock-agentcore-control", region_name=region)
+        response = client.get_agent_runtime(agentRuntimeId=runtime_id)
+        return {"status": response.get("status"), "error": None}
+    except (ClientError, BotoCoreError) as exc:
+        return {"status": None, "error": str(exc)}
+
+
 def refresh_status() -> None:
-    base_url = st.session_state.api_base_url.rstrip("/")
-    st.session_state.health = fetch_json(base_url, "/health")
-    st.session_state.readiness = fetch_json(base_url, "/health/ready")
+    if st.session_state.connection_mode == LOCAL_MODE:
+        base_url = st.session_state.api_base_url.rstrip("/")
+        st.session_state.health = fetch_json(base_url, "/health")
+        st.session_state.readiness = fetch_json(base_url, "/health/ready")
+    else:
+        st.session_state.runtime_status = fetch_runtime_status(
+            st.session_state.aws_region, st.session_state.agent_runtime_arn
+        )
     st.session_state.status_checked_at = datetime.now().strftime("%H:%M:%S")
 
 
@@ -95,11 +135,11 @@ def status_badge(ok: bool, good_label: str, bad_label: str) -> str:
     )
 
 
-def render_sidebar(settings) -> None:
-    st.sidebar.header("Connection")
+def render_local_connection() -> None:
     st.sidebar.text_input(
         "API base URL",
         key="api_base_url",
+        value=st.session_state.api_base_url,
         on_change=refresh_status,
         help="Where the FastAPI server (`amc-orchestrator`) is listening.",
     )
@@ -107,7 +147,6 @@ def render_sidebar(settings) -> None:
 
     health = st.session_state.get("health")
     readiness = st.session_state.get("readiness")
-    checked_at = st.session_state.get("status_checked_at")
 
     st.sidebar.markdown(status_badge(health is not None, "API online", "API unreachable"), unsafe_allow_html=True)
     if readiness is not None:
@@ -120,14 +159,67 @@ def render_sidebar(settings) -> None:
                 st.write(("✅ " if passed else "❌ ") + check)
     if health is not None:
         st.sidebar.caption(f"Environment: `{health.get('environment', 'unknown')}`")
-    if checked_at:
-        st.sidebar.caption(f"Last checked {checked_at}")
     if health is None:
         st.sidebar.warning(
             "Can't reach the API. Start it with:\n\n"
             "`uv run python -m amc_orchestrator.main`",
             icon="⚠️",
         )
+
+
+def render_runtime_connection() -> None:
+    st.sidebar.text_input(
+        "AWS region", key="aws_region", value=st.session_state.aws_region, on_change=refresh_status
+    )
+    st.sidebar.text_input(
+        "Agent Runtime ARN",
+        key="agent_runtime_arn",
+        value=st.session_state.agent_runtime_arn,
+        on_change=refresh_status,
+        help=(
+            "From `terraform output agent_runtime_arn` in "
+            "`infra/terraform/environments/<env>/` after pass 3."
+        ),
+    )
+    st.sidebar.caption(
+        "Uses whatever AWS credentials are already active in this "
+        "environment (e.g. `aws configure` or an SSO login) - the same "
+        "ones used for `terraform apply`. No separate login here."
+    )
+    st.sidebar.button("Refresh status", on_click=refresh_status, width="stretch")
+
+    status = st.session_state.get("runtime_status")
+    arn_entered = bool(st.session_state.agent_runtime_arn.strip())
+    if not arn_entered:
+        st.sidebar.warning("Enter an Agent Runtime ARN above to check its status.", icon="⚠️")
+    elif status is None:
+        st.sidebar.info("Status not checked yet.", icon="ℹ️")
+    elif status["error"]:
+        st.sidebar.markdown(status_badge(False, "", "Status check failed"), unsafe_allow_html=True)
+        st.sidebar.caption(status["error"])
+    else:
+        runtime_state = status["status"] or "UNKNOWN"
+        label = f"Runtime {runtime_state}"
+        st.sidebar.markdown(
+            status_badge(runtime_state == "READY", label, label),
+            unsafe_allow_html=True,
+        )
+
+
+def render_sidebar(settings) -> None:
+    st.sidebar.header("Connection")
+    st.sidebar.radio(
+        "Target", [LOCAL_MODE, RUNTIME_MODE], key="connection_mode", on_change=refresh_status
+    )
+
+    if st.session_state.connection_mode == LOCAL_MODE:
+        render_local_connection()
+    else:
+        render_runtime_connection()
+
+    checked_at = st.session_state.get("status_checked_at")
+    if checked_at:
+        st.sidebar.caption(f"Last checked {checked_at}")
 
     st.sidebar.divider()
     st.sidebar.header("Request settings")
@@ -138,9 +230,11 @@ def render_sidebar(settings) -> None:
         step=30,
         key="request_timeout",
         help=(
-            "DEV Ollama generation can take 5-10+ minutes end-to-end on "
-            "CPU-only hardware (see CLAUDE.md). Raise this if requests time "
-            "out. Bedrock runs typically finish in well under a minute."
+            "DEV Ollama generation (Local API server mode) can take 5-10+ "
+            "minutes end-to-end on CPU-only hardware (see CLAUDE.md). Raise "
+            "this if requests time out. Bedrock runs - whether via a local "
+            "API server with MODEL_PROVIDER=bedrock, or the deployed "
+            "Runtime - typically finish in well under a minute."
         ),
     )
 
@@ -179,7 +273,7 @@ def render_result(outcome: dict[str, Any], elapsed: float) -> None:
         st.json(outcome)
 
 
-def submit_rfp(base_url: str, question: str, timeout: float) -> tuple[dict[str, Any], float]:
+def submit_rfp_local(base_url: str, question: str, timeout: float) -> tuple[dict[str, Any], float]:
     start = time.perf_counter()
     response = httpx.post(
         f"{base_url}/api/v1/rfp",
@@ -191,6 +285,31 @@ def submit_rfp(base_url: str, question: str, timeout: float) -> tuple[dict[str, 
     return response.json(), elapsed
 
 
+def submit_rfp_runtime(
+    region: str, arn: str, question: str, timeout: float
+) -> tuple[dict[str, Any], float]:
+    """Invoke the deployed AgentCore Runtime directly via SigV4-signed boto3.
+
+    `invoke_agent_runtime`'s response body is the exact same `RfpOutcome`
+    JSON `runtime_entrypoint.py`'s `invoke()` returns - no separate parsing
+    needed, `render_result` handles it identically to the local API path.
+    """
+    client = boto3.client(
+        "bedrock-agentcore",
+        region_name=region,
+        config=BotoConfig(connect_timeout=min(timeout, 30), read_timeout=timeout),
+    )
+    start = time.perf_counter()
+    response = client.invoke_agent_runtime(
+        agentRuntimeArn=arn,
+        payload=json.dumps({"prompt": question}).encode("utf-8"),
+        contentType="application/json",
+    )
+    body = response["response"].read()
+    elapsed = time.perf_counter() - start
+    return json.loads(body), elapsed
+
+
 def main() -> None:
     settings = get_settings()
 
@@ -200,8 +319,14 @@ def main() -> None:
         layout="wide",
     )
 
+    if "connection_mode" not in st.session_state:
+        st.session_state.connection_mode = LOCAL_MODE
     if "api_base_url" not in st.session_state:
         st.session_state.api_base_url = f"http://localhost:{settings.api_port}"
+    if "aws_region" not in st.session_state:
+        st.session_state.aws_region = settings.aws_region
+    if "agent_runtime_arn" not in st.session_state:
+        st.session_state.agent_runtime_arn = ""
     if "request_timeout" not in st.session_state:
         st.session_state.request_timeout = 600
     if "question_text" not in st.session_state:
@@ -232,22 +357,36 @@ def main() -> None:
 
     if submitted:
         question = st.session_state.question_text.strip()
+        mode = st.session_state.connection_mode
         if not question:
             st.error("Enter a question before submitting.")
+        elif mode == RUNTIME_MODE and not st.session_state.agent_runtime_arn.strip():
+            st.error("Enter an Agent Runtime ARN in the sidebar first.")
         else:
-            base_url = st.session_state.api_base_url.rstrip("/")
+            spinner_text = "Running quant + qual retrieval, compliance review, and synthesis - " + (
+                "this can take several minutes on DEV Ollama..."
+                if mode == LOCAL_MODE
+                else "typically 5-15s against the deployed Runtime..."
+            )
             try:
-                with st.spinner(
-                    "Running quant + qual retrieval, compliance review, and "
-                    "synthesis - this can take several minutes on DEV Ollama..."
-                ):
-                    outcome, elapsed = submit_rfp(
-                        base_url, question, st.session_state.request_timeout
-                    )
+                with st.spinner(spinner_text):
+                    if mode == LOCAL_MODE:
+                        base_url = st.session_state.api_base_url.rstrip("/")
+                        outcome, elapsed = submit_rfp_local(
+                            base_url, question, st.session_state.request_timeout
+                        )
+                    else:
+                        outcome, elapsed = submit_rfp_runtime(
+                            st.session_state.aws_region,
+                            st.session_state.agent_runtime_arn.strip(),
+                            question,
+                            st.session_state.request_timeout,
+                        )
             except httpx.ConnectError:
                 st.error(
                     "Could not connect to the API. Confirm it's running at "
-                    f"`{base_url}` (`uv run python -m amc_orchestrator.main`)."
+                    f"`{st.session_state.api_base_url.rstrip('/')}` "
+                    "(`uv run python -m amc_orchestrator.main`)."
                 )
             except httpx.TimeoutException:
                 st.error(
@@ -257,6 +396,19 @@ def main() -> None:
                 )
             except httpx.HTTPStatusError as exc:
                 st.error(f"API returned {exc.response.status_code}: {exc.response.text}")
+            except ClientError as exc:
+                error = exc.response.get("Error", {})
+                st.error(
+                    f"AWS returned {error.get('Code', 'an error')}: "
+                    f"{error.get('Message', str(exc))}"
+                )
+            except BotoCoreError as exc:
+                st.error(
+                    "Could not reach the deployed Runtime - confirm AWS "
+                    "credentials are active in this environment (e.g. "
+                    f"`aws configure` or SSO login) and the region/ARN are "
+                    f"correct. Details: {exc}"
+                )
             else:
                 st.session_state.setdefault("history", []).insert(
                     0,

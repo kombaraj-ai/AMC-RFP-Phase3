@@ -3,10 +3,11 @@
 **AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment)**
 
 This is the practical, task-oriented companion to [`architecture.md`](architecture.md). It covers
-setup, running the system three ways (CLI, API, and a Streamlit UI), the mock data you can query
-against, troubleshooting, and (as of Phase 02) deploying the AWS infrastructure via Terraform.
-Examples use `uv` and PowerShell, matching this project's actual dev environment (Windows,
-`uv`-managed Python).
+setup, running the system locally three ways (CLI, API, and a Streamlit UI), the mock data you
+can query against, troubleshooting, and (as of Phase 02) deploying the AWS infrastructure via
+Terraform and testing the live, deployed AgentCore Runtime directly - no local server or Ollama
+involved at all. Examples use `uv` and PowerShell, matching this project's actual dev environment
+(Windows, `uv`-managed Python).
 
 ## Prerequisites
 
@@ -47,7 +48,7 @@ Set any of these as environment variables or in `environments/.env.dev`:
 | `MODEL_PROVIDER` | `ollama` | `ollama` \| `bedrock` — which LLM generates responses. Only takes effect in DEV; STAGING/PROD always use Bedrock regardless of this setting. See [Switching model provider](#switching-model-provider-ollama-vs-bedrock) below. |
 | `OLLAMA_HOST` | `http://localhost:11434` | Ollama server address. Used when the effective provider is Ollama. |
 | `OLLAMA_MODEL_ID` | `qwen2.5:7b-instruct` | Ollama model. Used when the effective provider is Ollama. |
-| `BEDROCK_MODEL_ID` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model. Used when the effective provider is Bedrock (always in staging/prod; opt-in in dev). |
+| `BEDROCK_MODEL_ID` | `anthropic.claude-3-5-sonnet-20241022-v2:0` | Bedrock model. Used when the effective provider is Bedrock (always in staging/prod; opt-in in dev). **This default reached end-of-life on Bedrock** (confirmed live, 2026-07-12 - see [Switching model provider](#switching-model-provider-ollama-vs-bedrock)) — override it, e.g. to `amazon.nova-lite-v1:0`, which the deployed dev Runtime now uses. |
 | `AWS_REGION` | `us-east-1` | Bedrock region. Used when the effective provider is Bedrock. |
 | `MODEL_TEMPERATURE_JUDGE` | `0.15` | `compliance_check` temperature. |
 | `MODEL_TEMPERATURE_WORKER` | `0.2` | `quant_data_pull`/`qual_narrative_pull`/`revise_draft` temperature. |
@@ -83,9 +84,21 @@ works.
 
    ```powershell
    $env:MODEL_PROVIDER = "bedrock"
-   $env:BEDROCK_MODEL_ID = "anthropic.claude-3-5-sonnet-20241022-v2:0"  # or another Bedrock model
+   $env:BEDROCK_MODEL_ID = "amazon.nova-lite-v1:0"  # or another Bedrock model you have access to
    $env:AWS_REGION = "us-east-1"
    ```
+
+   `anthropic.claude-3-5-sonnet-20241022-v2:0` (the code default) reached end-of-life on Bedrock -
+   confirmed live, 2026-07-12, when a real invocation returned `ResourceNotFoundException`. Check
+   `aws bedrock list-foundation-models --by-provider anthropic` (or the equivalent console page)
+   for what's currently `ACTIVE` in your account/region before picking a model. Note that
+   current-generation Anthropic models require a cross-region **inference profile** ID (e.g.
+   `us.anthropic.claude-sonnet-5`), not a plain on-demand model ID, which also needs extra IAM
+   permissions (see `infra/terraform/environments/dev/locals.tf`'s `bedrock_model_arns` comment if
+   you go that route) - `amazon.nova-lite-v1:0` avoids that complexity by supporting on-demand
+   invocation directly, and is sufficient for this project's structured-output need (Strands'
+   `BedrockModel.structured_output` only ever requests `tool_choice={"any": {}}`, which Nova
+   supports).
 
 3. Run the CLI or API exactly as before - no other change needed:
 
@@ -241,6 +254,19 @@ logic, no direct Ollama/Bedrock access; it's a thin HTTP client over the already
 server, the same way `cli.py` is. **Start the API server first** (see
 [Running via the API](#running-via-the-api)); the UI has nothing to talk to otherwise.
 
+**This cannot test the deployed AgentCore Runtime from Phase 02.** `streamlit_app.py` only ever
+makes a plain `httpx.post` to `{api_base_url}/api/v1/rfp` (a local FastAPI server) — it has no AWS
+SDK usage at all. `invoke_agent_runtime` (see
+[Testing the deployed AgentCore Runtime](#testing-the-deployed-agentcore-runtime-phase-02) below)
+requires an AWS SigV4-signed `boto3` call against a completely different endpoint/contract, which
+this UI does not implement. The closest you can get through this UI to what the deployed Runtime
+does is pointing a **local** API server at the real AWS data backends
+(`$env:DATA_BACKEND = "aws"` plus `MODEL_PROVIDER=bedrock` before `uv run python -m
+amc_orchestrator.main`, per [Switching model provider](#switching-model-provider-ollama-vs-bedrock))
+and running Streamlit against that — still not the containerized Runtime itself, just the same
+DynamoDB/Knowledge Base/Bedrock resources fronted by a locally-running API process instead of
+AgentCore. To test the actual deployed Runtime, use the boto3 script or AWS Console method below.
+
 ```powershell
 # One-time: pull in the UI's extra dependencies (Streamlit, on top of the base install)
 uv sync --group ui
@@ -352,6 +378,86 @@ Must be `linux/arm64` — AgentCore Runtime runs on Graviton, not optional. `<ec
 is pass 1's `ecr_repository_url` Terraform output. Once pushed, set
 `enable_agent_runtime = true` and `container_image_uri` in `terraform.tfvars` and apply — see
 `infra/terraform/README.md`'s "Pass 3" section.
+
+**Confirmed working end to end against real AWS, 2026-07-12** (dev environment) — all three
+passes applied, the Runtime is `READY`, and a real `invoke_agent_runtime` call returns a genuine
+APPROVED, synthesized report. See [Testing the deployed AgentCore Runtime](#testing-the-deployed-agentcore-runtime-phase-02)
+below for exactly how, and `CLAUDE.md`'s "Phase 02" section for the three real deploy bugs found
+and fixed along the way (a Dockerfile fix, a `MODEL_PROVIDER` fix, and the model end-of-life fix
+mentioned above) — useful background if your own deploy hits the same symptoms.
+
+### Enabling the Knowledge Base and ingesting documents (pass 2, in full)
+
+Pass 2 (`enable_knowledge_base = true` + apply) creates the vector index and an empty Knowledge
+Base — real document ingestion is a separate, manual step (Terraform never uploads documents or
+triggers ingestion). This is what actually happened for dev:
+
+```powershell
+# 1. Add your own applier ARN to terraform.tfvars first (see README's pass 2 section), then:
+terraform apply   # creates the vector index + empty Knowledge Base
+
+# 2. Upload documents to the KB's S3 bucket (kb_docs_bucket_name Terraform output)
+aws s3 cp fund_commentary.txt s3://<kb_docs_bucket_name>/fund_commentary.txt
+
+# 3. Trigger ingestion (knowledge_base_id is a Terraform output; find the data source id via
+#    `aws bedrock-agent list-data-sources --knowledge-base-id <knowledge_base_id>`)
+aws bedrock-agent start-ingestion-job --knowledge-base-id <knowledge_base_id> --data-source-id <data_source_id>
+
+# 4. Poll until COMPLETE
+aws bedrock-agent get-ingestion-job --knowledge-base-id <knowledge_base_id> --data-source-id <data_source_id> --ingestion-job-id <job_id>
+```
+
+For dev, the 4 mock-fund commentary texts already used to seed Chroma locally
+(`data/chroma_store.py`'s `_MOCK_COMMENTARY`) were uploaded this way and ingested cleanly (4
+scanned, 4 indexed, 0 failed) — see `CLAUDE.md` for the exact texts if you want to reproduce this
+for staging/prod.
+
+### Testing the deployed AgentCore Runtime (Phase 02)
+
+Once pass 3 is applied and the image is pushed, the Runtime is a real, invokable AWS resource —
+independent of anything on your local machine (no Ollama, no local server). Two ways to test it
+(the Streamlit UI is **not** one of them — see the note in
+[Running via the Streamlit UI](#running-via-the-streamlit-ui) above):
+
+**Python/boto3** (what was used to verify dev):
+
+```python
+import boto3, json
+
+client = boto3.client("bedrock-agentcore", region_name="us-east-1")
+resp = client.invoke_agent_runtime(
+    agentRuntimeArn="<agent_runtime_arn>",  # pass 3's Terraform output
+    payload=json.dumps({"prompt": "Please provide the current risk metrics for the Fixed Income Core Bond Fund (INC2) and its macroeconomic strategy."}).encode("utf-8"),
+    contentType="application/json",
+)
+print(resp["response"].read().decode("utf-8"))
+```
+
+Requires your AWS credentials (the same ones used for `terraform apply`) and `boto3` — no other
+setup, and no Ollama/local server involved at all.
+
+**AWS Console**: Bedrock console → AgentCore → Runtimes → your runtime → **Test** tab has a
+built-in invocation UI, no code needed.
+
+The AWS CLI installed in this project's dev environment is too old to have `bedrock-agentcore`
+commands — use one of the two methods above instead unless you upgrade it.
+
+**Confirmed working for all 4 mock funds against real AWS, 2026-07-12** (dev, post document
+ingestion) — same `invoke_agent_runtime` call, one query per fund (`"What are the current risk
+metrics for <fund name> (<ticker>), and what is the manager strategy commentary behind its risk
+profile?"`):
+
+| Fund | Result | `compliance_attempts` | Wall time |
+|------|--------|------------------------|-----------|
+| EQG1 (Equity Growth) | APPROVED | 1 | 6.9s |
+| SMC3 (Smallcap, high-risk) | APPROVED | 2 | 11.7s |
+| INC2 (Fixed Income) | APPROVED | 3 | 11.6s |
+| BLN4 (Balanced) | APPROVED | 3 | 13.5s |
+
+All four returned `succeeded=true, escalated=false, graph_status=completed` with real DynamoDB
+quant metrics correctly matched to the right ticker and real Knowledge-Base-retrieved commentary
+grounded together, no fabrication — at 7-14 seconds per query, versus Ollama's 5-10+ *minute*
+baseline for the equivalent local query (see [Troubleshooting](#troubleshooting)).
 
 ## Troubleshooting
 

@@ -484,6 +484,75 @@ a real APPROVED completion is expected once pass 2 lands.
       end-to-end completion of the deployed AgentCore Runtime, not just a
       graceful escalation.
 
+- [x] **All 4 mock funds tested live against the deployed Runtime,
+      2026-07-12** - same `invoke_agent_runtime` call, one query per fund
+      (fund performance + manager strategy commentary), all real AWS,
+      post-pass-2:
+
+      | Fund | Result | `compliance_attempts` | Wall time |
+      |------|--------|------------------------|-----------|
+      | EQG1 (Equity Growth) | APPROVED | 1 | 6.9s |
+      | SMC3 (Smallcap, high-risk) | APPROVED | 2 | 11.7s |
+      | INC2 (Fixed Income) | APPROVED | 3 | 11.6s |
+      | BLN4 (Balanced) | APPROVED | 3 | 13.5s |
+
+      All four: `succeeded=true, escalated=false, graph_status=completed`,
+      with real DynamoDB quant metrics correctly matched to the right
+      ticker and real Knowledge-Base-retrieved commentary grounded
+      together with no fabrication (e.g. BLN4's response correctly cited
+      the specific "5% rebalanced from cyclical equities into short-term
+      corporate bonds" detail from its ingested commentary doc). SMC3 and
+      BLN4 needed real revise/re-check cycles to reach APPROVED rather
+      than passing on the first attempt, showing the compliance loop is
+      doing real work, not rubber-stamping. This is the full mock dataset
+      confirmed working end-to-end on Bedrock/Nova Lite, at 7-14s per
+      query versus Ollama's 5-10+ *minutes* baseline (see "Known
+      slow/flaky things in DEV").
+
+- [x] **Streamlit UI: SigV4-backed "Deployed AgentCore Runtime (AWS)" mode
+      added, 2026-07-12** - `src/amc_orchestrator/ui/streamlit_app.py` gained
+      a sidebar "Target" radio (`LOCAL_MODE` / `RUNTIME_MODE`). Runtime mode
+      calls `boto3`'s `invoke_agent_runtime` directly (SigV4-signed, no local
+      server involved at all) - shows AWS region + Agent Runtime ARN inputs
+      instead of the API base URL field, plus a live status badge
+      (`bedrock-agentcore-control`'s `get_agent_runtime`, id parsed from the
+      ARN's last path segment). Both modes return the identical `RfpOutcome`
+      JSON shape, so `render_result` needed no changes.
+
+      **Real bug found and fixed via live browser-driven testing** (per this
+      project's UI-testing convention - `chromium-cli` wasn't available in
+      this environment, so Playwright was installed standalone into the
+      scratchpad and driven via a small Node script instead): a genuine
+      Streamlit widget-lifecycle quirk, reproduced in an isolated 20-line
+      script before touching the real file to rule out anything else being
+      the cause. A `key`-bound widget (e.g. `st.text_input(..., key="aws_region")`,
+      no explicit `value=`) only reliably shows a pre-populated
+      `st.session_state[key]` as its *displayed* value if the widget is
+      instantiated on the **same script run** where that default was first
+      set. Since Local mode is the default target, the Runtime-only widgets
+      only render for the first time on a **later** rerun (after the user
+      switches modes) - and Streamlit rendered them blank instead of picking
+      up the already-correct session_state value (confirmed via a temporary
+      debug probe: `st.session_state["aws_region"]` read back `'us-east-1'`
+      correctly in Python at the exact moment the widget rendered empty in
+      the browser). This surfaced as a real, user-facing failure: entering
+      the real deployed Runtime ARN raised `ValueError: Invalid endpoint:
+      https://bedrock-agentcore-control..amazonaws.com` (empty region).
+      Fixed by passing `value=` explicitly on all three affected
+      `text_input`s (API base URL included, defensively, even though it
+      wasn't observed broken - it only "worked" by coincidence of being the
+      default-rendered branch).
+
+      **Live end-to-end proof, via the actual browser UI, not just
+      `boto3` directly**: Playwright driving headless Chromium against the
+      real running Streamlit app confirmed all 4 steps - default state
+      unchanged, mode switch shows the right fields, entering the real
+      Runtime ARN shows a genuine **"Runtime READY"** badge, and submitting
+      the INC2 example query in Runtime mode returned a real synthesized
+      report (**Approved, 1 compliance attempt, 8.3s**) rendered correctly
+      via the existing result view - screenshotted at each step, zero
+      console errors.
+
 ### Immediate next step (resume here)
 
 1. Staging/prod applies (all three deploy bugs found this session were
