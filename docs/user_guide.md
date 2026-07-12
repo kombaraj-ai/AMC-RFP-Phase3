@@ -466,30 +466,109 @@ triggers ingestion).
   [`architecture.md`](architecture.md#dev-only-vector-store-choice-opensearch-serverless-vs-s3-vectors)
   for the full design.
 
-Document ingestion (the steps below) is identical regardless of which backend is selected — it
-uploads to the same S3 docs bucket either way. This is what actually happened for dev (on the
-`"opensearch"` backend, before the S3 Vectors option existed):
+Document ingestion below is identical regardless of which backend is selected — it uploads to the
+same S3 docs bucket either way, and the Knowledge Base itself abstracts away whether the
+resulting vectors land in OpenSearch or S3 Vectors. Terraform only ever creates an *empty*
+Knowledge Base — nothing in Pass 2 uploads a document or triggers ingestion, so every step below
+is something you (or a script) has to do explicitly, every time you want to (re-)populate it.
+
+**(opensearch backend only) Before this pass**: add your own applier ARN to
+`additional_data_access_principals` in `terraform.tfvars` (see README's Pass 2 section), then
+`terraform apply` to create the vector index + empty Knowledge Base. The `s3_vectors` backend
+doesn't need this step at all.
+
+#### Step 1 — Get the source documents as real files
+
+The Knowledge Base's data source only ever reads from S3 — it can't ingest a Python string
+directly. The mock-fund commentary text already used to seed the local Chroma store in DEV lives
+*only* as Python string literals in `data/chroma_store.py`'s `_MOCK_COMMENTARY` list — there's no
+standalone `.txt` file for it anywhere in the repo. For a real cloud deploy you have to write each
+fund's text out to its own file first (copy the exact strings out of that list):
 
 ```powershell
-# 1. (opensearch backend only) Add your own applier ARN to terraform.tfvars first (see README's
-#    pass 2 section), then:
-terraform apply   # creates the vector index + empty Knowledge Base
-
-# 2. Upload documents to the KB's S3 bucket (kb_docs_bucket_name Terraform output)
-aws s3 cp fund_commentary.txt s3://<kb_docs_bucket_name>/fund_commentary.txt
-
-# 3. Trigger ingestion (knowledge_base_id is a Terraform output; find the data source id via
-#    `aws bedrock-agent list-data-sources --knowledge-base-id <knowledge_base_id>`)
-aws bedrock-agent start-ingestion-job --knowledge-base-id <knowledge_base_id> --data-source-id <data_source_id>
-
-# 4. Poll until COMPLETE
-aws bedrock-agent get-ingestion-job --knowledge-base-id <knowledge_base_id> --data-source-id <data_source_id> --ingestion-job-id <job_id>
+mkdir kb_docs
+"Global Equity Growth Fund (EQG1): We maintain a structural overweight in mega-cap technology..." `
+  | Out-File -Encoding utf8 kb_docs\doc_eqg1.txt
+"Alpha Prime Smallcap Direct Fund (SMC3): The fund exhibits high volatility..." `
+  | Out-File -Encoding utf8 kb_docs\doc_smc3.txt
+"Fixed Income Core Bond Fund (INC2): We have actively reduced duration risk..." `
+  | Out-File -Encoding utf8 kb_docs\doc_inc2.txt
+"Balanced Conservative Wealth Fund (BLN4): A multi-asset dynamic allocation framework..." `
+  | Out-File -Encoding utf8 kb_docs\doc_bln4.txt
 ```
 
-For dev, the 4 mock-fund commentary texts already used to seed Chroma locally
-(`data/chroma_store.py`'s `_MOCK_COMMENTARY`) were uploaded this way and ingested cleanly (4
-scanned, 4 indexed, 0 failed) — see `CLAUDE.md` for the exact texts if you want to reproduce this
-for staging/prod.
+(Truncated above for readability — use the full text from `_MOCK_COMMENTARY`, not these `...`
+fragments.)
+
+#### Step 2 — Upload each file to the Knowledge Base's S3 docs bucket
+
+This is the bucket `modules/s3-kb-docs` created back in Pass 1 — its real name is a Terraform
+output, not something you choose or hardcode:
+
+```powershell
+$bucket = terraform output -raw kb_docs_bucket_name   # e.g. amc-orchestrator-dev-kb-docs-766354255780
+aws s3 cp kb_docs\doc_eqg1.txt s3://$bucket/doc_eqg1.txt
+aws s3 cp kb_docs\doc_smc3.txt s3://$bucket/doc_smc3.txt
+aws s3 cp kb_docs\doc_inc2.txt s3://$bucket/doc_inc2.txt
+aws s3 cp kb_docs\doc_bln4.txt s3://$bucket/doc_bln4.txt
+```
+
+At this point the files exist in S3, but **the Knowledge Base has no idea they're there yet** —
+Bedrock never watches the bucket automatically. Ingestion has to be triggered explicitly (step 4).
+
+#### Step 3 — Look up the data source ID
+
+`start-ingestion-job` (next step) needs both a `knowledge-base-id` (a Terraform output:
+`knowledge_base_id`) *and* a `data-source-id`, which is **not** a Terraform output —
+`modules/knowledge-base` creates exactly one data source per Knowledge Base, but AWS only assigns
+its ID at creation time, so you look it up rather than compute it:
+
+```powershell
+$kbId = terraform output -raw knowledge_base_id
+aws bedrock-agent list-data-sources --knowledge-base-id $kbId
+# copy the "dataSourceId" value from the JSON output, e.g. "5LFXDA9A5K"
+```
+
+#### Step 4 — Trigger the ingestion job
+
+This is the step that actually does the work: Bedrock reads every object currently in the S3 docs
+bucket, splits each one into chunks (per `modules/knowledge-base`'s `chunking_max_tokens`/
+`chunking_overlap_percentage` settings, defaults 512/20%), calls the embedding model (Titan V2 by
+default) on each chunk, and writes the resulting vectors into whichever backend
+`vector_store_backend` selected. It's **asynchronous** — this call only *starts* the job and
+returns immediately, it doesn't wait for it to finish:
+
+```powershell
+$dataSourceId = "<paste the dataSourceId from step 3>"
+aws bedrock-agent start-ingestion-job --knowledge-base-id $kbId --data-source-id $dataSourceId
+# copy the "ingestionJobId" value from the JSON output, e.g. "WEF8FEIYNO"
+```
+
+#### Step 5 — Poll until it finishes
+
+A job moves through `STARTING` → `IN_PROGRESS` → `COMPLETE` (or `FAILED`) — there's no webhook or
+notification, so you have to poll it yourself. For 4 small text files this typically completes in
+well under a minute:
+
+```powershell
+$jobId = "<paste the ingestionJobId from step 4>"
+do {
+  Start-Sleep -Seconds 5
+  $job = aws bedrock-agent get-ingestion-job --knowledge-base-id $kbId --data-source-id $dataSourceId --ingestion-job-id $jobId | ConvertFrom-Json
+  Write-Host $job.ingestionJob.status
+} while ($job.ingestionJob.status -notin @("COMPLETE", "FAILED"))
+$job.ingestionJob.statistics   # numberOfDocumentsScanned / numberOfNewDocumentsIndexed / numberOfDocumentsFailed
+```
+
+`numberOfDocumentsFailed` should be `0`. If it isn't, the individual document errors aren't in
+this response — check the Knowledge Base's ingestion job details in the Bedrock console for the
+per-document failure reason.
+
+**Confirmed working, dev, 2026-07-12**: all 4 mock-fund commentary texts uploaded and ingested
+exactly via steps 1–5 above — `numberOfDocumentsScanned: 4, numberOfNewDocumentsIndexed: 4,
+numberOfDocumentsFailed: 0`, confirmed complete on the very first 5-second poll. See
+`CLAUDE.md`'s "Phase 02" section for the full session log, and `data/chroma_store.py`'s
+`_MOCK_COMMENTARY` for the exact source text if you're reproducing this for staging/prod.
 
 ### Testing the deployed AgentCore Runtime (Phase 02)
 
