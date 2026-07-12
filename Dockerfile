@@ -12,8 +12,10 @@ FROM --platform=linux/arm64 ghcr.io/astral-sh/uv:python3.12-bookworm-slim
 WORKDIR /app
 
 # Dependencies first for better layer caching - only re-resolved when these
-# actually change, not on every source edit.
-COPY pyproject.toml uv.lock ./
+# actually change, not on every source edit. README.md is required here too
+# - pyproject.toml declares it as the package readme, and hatchling's build
+# backend fails without it even for --no-install-project.
+COPY pyproject.toml uv.lock README.md ./
 RUN uv sync --frozen --no-cache --no-install-project
 
 COPY src/ ./src/

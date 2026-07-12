@@ -401,34 +401,87 @@ Terraform-only plan's content lives on in this log, not in that file):
       swap, Dockerfile) - written and verified: 64 unit tests pass, a real
       local `uvicorn` + real Ollama end-to-end `/invocations` call
       succeeded.
-- [ ] **Not done**: `docker build` itself (Docker Desktop's daemon wasn't
-      running last session), pushing an image to ECR, `enable_agent_runtime
-      = true` + apply (the actual invokable Runtime), pass 2
-      (`enable_knowledge_base = true` - vector index + real Bedrock
-      Knowledge Base), staging/prod applies, real document ingestion into
-      the Knowledge Base, and the deliberately-deferred Gateway-routed
-      tools / AgentCore Memory graph integration.
+- [x] `docker build`/`push`, `enable_agent_runtime = true` + apply, and a
+      live end-to-end `invoke_agent_runtime` smoke test - all done and
+      **live-verified against real AWS, 2026-07-12**. Three real bugs found
+      and fixed along the way (see below); the first two would have blocked
+      *every* invocation of the deployed Runtime, not just this smoke test.
+      Pass 2 (`enable_knowledge_base = true`), staging/prod applies, real
+      document ingestion, and the deferred Gateway-routed tools / AgentCore
+      Memory graph integration remain **not done**.
+
+**Real bugs found live this session, all fixed and re-verified, 2026-07-12**:
+1. **Dockerfile missing README.md**: `pyproject.toml` declares `readme =
+   "README.md"`, but the Dockerfile only `COPY`'d `pyproject.toml`/`uv.lock`
+   before `uv sync --no-install-project` - hatchling's build backend fails
+   without the readme file present even for that no-install-project pass.
+   Fixed by adding `README.md` to that `COPY` line. First-ever real `docker
+   build` of this Dockerfile - this was always going to fail, no prior
+   session had actually run it.
+2. **Deployed dev Runtime defaulted to Ollama, unreachable from AWS**:
+   `Settings.effective_model_provider` deliberately respects `model_provider`
+   (default `"ollama"`) whenever `environment == "dev"`, so a *local* dev
+   run can opt into Bedrock - but the *deployed* Runtime container also sets
+   `ENVIRONMENT=dev` (same env-var name, different purpose), and
+   `infra/terraform/environments/dev/main.tf`'s `agentcore_runtime` module
+   never set `MODEL_PROVIDER`. Every invocation failed with `ConnectError:
+   All connection attempts failed` (trying to reach `localhost:11434`
+   inside the container). Fixed by hardcoding `MODEL_PROVIDER = "bedrock"`
+   in that module's `environment_variables` - staging/prod don't need this
+   since `environment != "dev"` already forces Bedrock for them via
+   `effective_model_provider`.
+3. **`bedrock_model_id` (`anthropic.claude-3-5-sonnet-20241022-v2:0`) had
+   reached end-of-life** on Bedrock (a real `invoke_agent_runtime` call
+   returned `ResourceNotFoundException`) - confirmed via
+   `bedrock:ListFoundationModels`/`GetFoundationModel` that current-gen
+   Anthropic models on this account now require `INFERENCE_PROFILE`
+   invocation, not `ON_DEMAND`. Rather than wire up the extra
+   inference-profile IAM ARNs, switched `bedrock_model_id` to
+   `amazon.nova-lite-v1:0` instead (user's choice) - `ON_DEMAND`-invokable,
+   no profile complexity, cheaper. Verified it's sufficient for this
+   project's structured-output need: `strands/models/bedrock.py`'s
+   `BedrockModel.structured_output` only ever requests
+   `tool_choice={"any": {}}` (force *some* tool use - never a named-tool
+   force, since only one tool spec is ever passed), and Nova supports
+   `"any"` tool choice via the Converse API. `locals.tf`'s
+   `bedrock_model_arns` and both the runtime/KB IAM policies were updated
+   to the new model ARN.
+
+**Live end-to-end proof, 2026-07-12** (`invoke_agent_runtime` against
+`arn:aws:bedrock-agentcore:us-east-1:766354255780:runtime/amc_orchestrator_dev_agent_runtime-X1c5y89vze`,
+the INC2 low-risk query): `succeeded=true, graph_status=completed,
+compliance_attempts=3, escalated=true` - a well-formed graceful escalation,
+not a crash, and the *expected* outcome given `enable_knowledge_base` is
+still `false` (no commentary data exists yet for `qual_narrative_pull` to
+retrieve, so REJECTED verdicts are honest, not a bug). This proves the
+Runtime, its IAM role, DynamoDB self-seeding (`runtime_entrypoint.py`'s
+`lifespan` hook), and real Bedrock invocation all genuinely work in AWS -
+a real APPROVED completion is expected once pass 2 lands.
 
 ### Immediate next step (resume here)
 
-1. Start Docker Desktop, then `docker build --platform linux/arm64 -t
-   <ecr_repository_url>:v1 .` from the repo root (`ecr_repository_url` is
-   dev pass 1's Terraform output) - **not yet verified this session**, do
-   this first since everything after it depends on a working image.
-2. `docker push` that image, then in `infra/terraform/environments/dev/`:
-   set `enable_agent_runtime = true` and `container_image_uri` in
-   `terraform.tfvars`, `terraform apply` - the first real, invokable
-   AgentCore Runtime. Confirm with the user first (real AWS action), don't
-   auto-run.
-3. Separately (order-independent from #1/#2): pass 2 -
-   `enable_knowledge_base = true` (after adding the applier's principal to
-   `additional_data_access_principals`), apply - creates the vector index
-   + Knowledge Base. Real document ingestion (S3 upload +
-   `start_ingestion_job`) is a further, separate step after that.
-4. **Uncommitted work**: `git status` shows ~30 changed/new files from
-   this phase, not yet committed (Phase 01's convention is one commit per
-   milestone - worth committing in logical chunks - e.g. Terraform infra,
-   then the app-code follow-on - rather than one giant commit, but wasn't
+1. Pass 2: `enable_knowledge_base = true` in
+   `infra/terraform/environments/dev/terraform.tfvars` (after adding the
+   applier's principal to `additional_data_access_principals`), apply -
+   creates the vector index + real Bedrock Knowledge Base. Real document
+   ingestion (S3 upload + `start_ingestion_job`) is a further, separate
+   step after that - needed before a real APPROVED completion is possible
+   end-to-end.
+2. Re-run the same `invoke_agent_runtime` smoke test after pass 2 +
+   ingestion to confirm a real compliant synthesized report, not just the
+   escalation path.
+3. Staging/prod applies (all three real bugs above are dev-tfvars-only
+   fixes so far - `environments/staging/`/`environments/prod/` still
+   reference the same end-of-life Claude model ID and will need the same
+   `bedrock_model_id`/IAM update before their eventual first apply,
+   though they don't have the `MODEL_PROVIDER` issue since
+   `environment != "dev"` already forces Bedrock for them).
+4. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
+   integration.
+5. **Uncommitted work**: `git status` shows the Terraform/app-code files
+   from this phase plus this session's Dockerfile/dev-tfvars fixes, not yet
+   committed (Phase 01's convention is one commit per milestone - worth
+   committing in logical chunks rather than one giant commit, but wasn't
    asked to do so yet this session).
 
 Provisions every AWS resource the deployed system needs (AgentCore

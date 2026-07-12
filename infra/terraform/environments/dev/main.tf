@@ -145,7 +145,16 @@ module "agentcore_runtime" {
   tags                = local.common_tags
 
   environment_variables = {
-    ENVIRONMENT                    = var.environment
+    ENVIRONMENT = var.environment
+    # `Settings.effective_model_provider` only forces Bedrock when
+    # `environment != "dev"` - by design, so a *local* dev run (CLI/API on a
+    # dev machine) can default to Ollama. But this deployed Runtime container
+    # also sets ENVIRONMENT=dev, and there is no Ollama reachable from AWS -
+    # without this, the container tries to reach localhost:11434 and every
+    # invocation fails with a connection error. Force Bedrock explicitly here;
+    # staging/prod don't need this since `environment != "dev"` already forces
+    # it for them.
+    MODEL_PROVIDER                 = "bedrock"
     DYNAMODB_TABLE_NAME            = module.dynamodb.table_name
     OPENSEARCH_COLLECTION_ENDPOINT = module.opensearch_serverless.collection_endpoint
     BEDROCK_KNOWLEDGE_BASE_ID      = var.enable_knowledge_base ? module.knowledge_base[0].knowledge_base_id : ""
