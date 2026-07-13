@@ -1,0 +1,194 @@
+name: Deploy
+
+# workflow_dispatch only - this is the ONLY workflow that ever mutates AWS.
+# Nothing auto-deploys on merge, for any environment (a deliberate choice -
+# see infra/terraform/README.md's CI/CD section). dev builds fresh from
+# source; staging/prod promote an already-built dev image byte-for-byte via
+# `crane copy` rather than rebuilding (build-once-promote), so what reaches
+# prod is guaranteed identical to what was tested in dev/staging.
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: Target environment
+        type: choice
+        required: true
+        options: [dev, staging, prod]
+      image_tag:
+        description: >-
+          Image tag to promote into staging/prod - must already exist in
+          dev's ECR repo (e.g. a git SHA from a prior dev deploy run).
+          Required for staging/prod, ignored for dev (dev always builds
+          fresh from the current commit). Never use "latest" - always an
+          explicit, immutable tag.
+        type: string
+        required: false
+        default: ""
+      promote_image:
+        description: >-
+          Promote an image into this environment's apply. Set to false for
+          a staging/prod pass-1/pass-2-only apply where no image is
+          involved yet (enable_agent_runtime still false in tfvars) - see
+          docs/ci_cd_runbook.md's first-time rollout sequence.
+        type: boolean
+        required: false
+        default: true
+
+concurrency:
+  group: deploy-${{ inputs.environment }}
+  cancel-in-progress: false
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  build-and-push:
+    name: Build & push (dev)
+    if: inputs.environment == 'dev'
+    runs-on: ubuntu-latest
+    environment: dev
+    permissions:
+      id-token: write
+      contents: read
+    outputs:
+      image_tag: ${{ github.sha }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "url=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+
+      # linux/arm64 is a hard requirement - AgentCore Runtime runs on
+      # Graviton (see Dockerfile's header comment).
+      - name: Build and push
+        run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            -t ${{ steps.registry.outputs.url }}/amc-orchestrator-dev-agent-runtime:${{ github.sha }} \
+            --push \
+            .
+
+  promote:
+    name: Promote image (${{ inputs.environment }})
+    if: inputs.environment != 'dev' && inputs.promote_image
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Resolve ECR registry
+        id: registry
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          echo "url=${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com" >> "$GITHUB_OUTPUT"
+
+      # Same AWS account/region for every environment, so this one login
+      # authenticates against dev's repo (read, via deploy_role.tf's
+      # CrossEnvReadDevEcrForPromotion statement) and this environment's own
+      # repo (write) simultaneously - both live under the same registry host.
+      - uses: aws-actions/amazon-ecr-login@v2
+
+      - uses: imjasonh/setup-crane@v0.4
+
+      - name: Validate image_tag input
+        run: |
+          if [ -z "${{ inputs.image_tag }}" ]; then
+            echo "::error::image_tag is required when promoting to staging/prod - specify the exact dev-built tag (a git SHA) to promote, never a moving tag like 'latest'."
+            exit 1
+          fi
+
+      # Copies the manifest+layers by digest directly between registries -
+      # no local docker pull/push round-trip, no QEMU needed (crane never
+      # executes the image, only copies bytes) - so the promoted image is
+      # byte-for-byte identical to what dev built and tested.
+      - name: Promote (crane copy, no rebuild)
+        run: |
+          crane copy \
+            ${{ steps.registry.outputs.url }}/amc-orchestrator-dev-agent-runtime:${{ inputs.image_tag }} \
+            ${{ steps.registry.outputs.url }}/amc-orchestrator-${{ inputs.environment }}-agent-runtime:${{ inputs.image_tag }}
+
+  terraform-apply:
+    name: terraform apply (${{ inputs.environment }})
+    needs: [build-and-push, promote]
+    if: |
+      always() &&
+      (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') &&
+      (needs.promote.result == 'success' || needs.promote.result == 'skipped')
+    runs-on: ubuntu-latest
+    # Declaring `environment:` here is what scopes this job's
+    # vars.AWS_DEPLOY_ROLE_ARN lookup to the right per-environment value, and
+    # keeps GitHub's "restrict deployment branches to main" setting
+    # enforced - see docs/ci_cd_runbook.md. Deliberately no required-reviewer
+    # gate (see that doc for why, given this is a single-maintainer project).
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.7"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      # Passed via -var at apply time, never committed into tracked tfvars -
+      # decouples app-deploy cadence from infra-config commits (see
+      # infra/terraform/README.md's CI/CD section). Empty string is
+      # harmless whenever enable_agent_runtime is still false (pass 1/2 of
+      # a first-time staging/prod rollout - see docs/ci_cd_runbook.md).
+      - name: Resolve container image URI
+        id: image
+        run: |
+          ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+          REGISTRY="${ACCOUNT_ID}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          if [ "${{ inputs.environment }}" = "dev" ]; then
+            URI="${REGISTRY}/amc-orchestrator-dev-agent-runtime:${{ needs.build-and-push.outputs.image_tag }}"
+          elif [ "${{ inputs.promote_image }}" = "true" ]; then
+            URI="${REGISTRY}/amc-orchestrator-${{ inputs.environment }}-agent-runtime:${{ inputs.image_tag }}"
+          else
+            URI=""
+          fi
+          echo "uri=${URI}" >> "$GITHUB_OUTPUT"
+
+      - name: Write backend.hcl
+        run: |
+          cat > backend.hcl <<EOF
+          bucket = "${{ vars.TF_STATE_BUCKET }}"
+          key    = "${{ inputs.environment }}/terraform.tfstate"
+          region = "${{ env.AWS_REGION }}"
+          EOF
+
+      - run: terraform init -backend-config=backend.hcl
+
+      - name: terraform apply
+        run: |
+          terraform apply -auto-approve \
+            -var="container_image_uri=${{ steps.image.outputs.uri }}"

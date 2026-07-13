@@ -1,0 +1,10 @@
+# Copy to terraform.tfvars and fill in with your real GitHub repository -
+# these values shape the OIDC trust policies' `sub` claim conditions (see
+# oidc_provider.tf/plan_role.tf/deploy_role.tf), so they must exactly match
+# where this code actually lives once pushed to GitHub.
+
+github_org  = "<your-github-org-or-username>"
+github_repo = "<your-repo-name>"
+
+# From: terraform -chdir=infra/terraform/bootstrap output state_bucket_name
+state_bucket_name = "amc-orchestrator-tfstate-<account-id>"

@@ -1,0 +1,216 @@
+name: PR Validate
+
+# Runs automatically on every pull request to main. Never mutates AWS - the
+# tf-plan job below assumes a read-only OIDC role (see
+# infra/terraform/github-oidc/plan_role.tf) precisely so this workflow stays
+# safe to run unattended on every PR, including from less-trusted pushes.
+# Deploys/applies only ever happen from deploy.yml, which is
+# workflow_dispatch-only.
+
+on:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: pr-validate-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  changes:
+    name: Detect changed areas
+    runs-on: ubuntu-latest
+    outputs:
+      app: ${{ steps.filter.outputs.app }}
+      docker: ${{ steps.filter.outputs.docker }}
+      terraform: ${{ steps.filter.outputs.terraform }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            app:
+              - 'src/**'
+              - 'tests/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+            docker:
+              - 'src/**'
+              - 'pyproject.toml'
+              - 'uv.lock'
+              - 'Dockerfile'
+              - '.dockerignore'
+            terraform:
+              - 'infra/terraform/**'
+
+  lint:
+    name: Lint (ruff)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync
+      - run: uv run ruff check .
+      - run: uv run ruff format --check .
+
+  typecheck:
+    name: Type check (mypy)
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync
+      - run: uv run mypy src
+
+  unit-tests:
+    name: Unit tests
+    needs: changes
+    if: needs.changes.outputs.app == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v5
+        with:
+          version: "latest"
+      - run: uv sync
+      # Use `python -m pytest`, not the `uv run pytest` launcher - this
+      # repo's own CLAUDE.md documents the launcher misresolving imports on
+      # Windows dev machines; harmless here on Linux, kept consistent with
+      # local dev docs anyway.
+      - run: uv run python -m pytest tests/unit -q
+
+  docker-build-sanity:
+    name: Docker build sanity check
+    needs: changes
+    if: needs.changes.outputs.docker == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-qemu-action@v3
+      - uses: docker/setup-buildx-action@v3
+      # linux/arm64 is a hard requirement (AgentCore Runtime runs on
+      # Graviton, see Dockerfile's header comment) - QEMU emulation makes
+      # the cross-arch build possible on the default x86_64 runner.
+      # --output=type=cacheonly validates the build without producing or
+      # pushing a real, taggable image.
+      - run: |
+          docker buildx build \
+            --platform linux/arm64 \
+            -f Dockerfile \
+            --output=type=cacheonly \
+            .
+
+  tf-fmt-validate:
+    name: terraform fmt/validate (${{ matrix.environment }})
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.7"
+      # No AWS credentials needed for either of these - see
+      # infra/terraform/README.md's own documented claim that `validate`
+      # (unlike `plan`/`apply`) needs no credentials.
+      - run: terraform fmt -check -recursive
+        working-directory: infra/terraform
+      - run: terraform init -backend=false
+      - run: terraform validate
+
+  tf-plan:
+    name: terraform plan (${{ matrix.environment }})
+    needs: changes
+    if: needs.changes.outputs.terraform == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    strategy:
+      matrix:
+        environment: [dev, staging, prod]
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ matrix.environment }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.7"
+      # Shared, repo-level, READ-ONLY role - deliberately not the
+      # per-environment deploy role, since this job runs automatically on
+      # every PR. See infra/terraform/github-oidc/plan_role.tf for why this
+      # is a repo-level variable rather than Environment-scoped.
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_PLAN_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+      - name: Write backend.hcl
+        run: |
+          cat > backend.hcl <<EOF
+          bucket = "${{ vars.TF_STATE_BUCKET }}"
+          key    = "${{ matrix.environment }}/terraform.tfstate"
+          region = "${{ env.AWS_REGION }}"
+          EOF
+      - run: terraform init -backend-config=backend.hcl
+      - name: terraform plan
+        id: plan
+        run: terraform plan -out=tfplan -no-color
+        continue-on-error: true
+      - name: terraform show
+        id: show
+        run: terraform show -no-color tfplan
+      - name: Post plan as PR comment
+        uses: actions/github-script@v7
+        env:
+          PLAN_OUTPUT: ${{ steps.show.outputs.stdout }}
+          PLAN_ENV: ${{ matrix.environment }}
+        with:
+          script: |
+            const marker = `<!-- tf-plan:${process.env.PLAN_ENV} -->`;
+            const body = `${marker}\n### Terraform plan — \`${process.env.PLAN_ENV}\`\n<details><summary>Show plan</summary>\n\n\`\`\`\n${process.env.PLAN_OUTPUT}\n\`\`\`\n</details>`;
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body.startsWith(marker));
+            if (existing) {
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+      - name: Fail if plan errored
+        if: steps.plan.outcome == 'failure'
+        run: exit 1

@@ -123,11 +123,21 @@ terraform apply
 ```
 
 Creates: the vector index (`modules/opensearch-index` or `modules/s3-vectors`,
-whichever `vector_store_backend` selects) and the Bedrock Knowledge Base +
-S3 data source (`modules/knowledge-base`), empty - document ingestion is a
-separate, later step, not part of this Terraform, and is identical
-regardless of which vector-store backend was chosen (it uploads to the same
-S3 docs bucket either way).
+whichever `vector_store_backend` selects), the Bedrock Knowledge Base + S3
+data source (`modules/knowledge-base`), empty, and the auto-sync pipeline
+(`modules/kb-ingestion-sync` - an SQS queue + DLQ + Lambda wired to the docs
+bucket's `s3:ObjectCreated:*`/`s3:ObjectRemoved:*` events, which calls
+`bedrock-agent:StartIngestionJob` whenever a document changes). The *first*
+upload of documents to the S3 docs bucket is still a separate, manual/CI
+step (this Terraform only provisions the bucket, never populates it) - but
+every upload/delete after that re-syncs the Knowledge Base automatically
+within `maximum_batching_window_seconds` (default 5 minutes), no manual
+`start_ingestion_job` call needed. See `modules/kb-ingestion-sync/main.tf`
+for the SQS batching design and `modules/iam/kb_ingestion_sync_role.tf` for
+why its `bedrock:StartIngestionJob` permission is wildcarded to
+`knowledge-base/*` rather than scoped to one KB ARN (avoids the same
+iam↔knowledge_base module cycle already solved once for OpenSearch's access
+policy).
 
 ### Pass 3 — the agent runtime itself
 
@@ -149,6 +159,35 @@ Then:
 terraform apply
 ```
 
+## CI/CD (GitHub Actions)
+
+As of Phase 3, the manual commands in "Per-environment apply" above are
+normally run through two GitHub Actions workflows instead of by hand -
+`docker build`/`docker push`/`terraform apply` are still exactly the same
+underlying operations, just automated. Full setup steps and the
+`github-oidc/` module's design are in
+[`docs/ci_cd_runbook.md`](../../docs/ci_cd_runbook.md); short version:
+
+- **`.github/workflows/pr-validate.yml`** - runs automatically on every PR
+  to `main`. Lint/type-check/unit tests for app changes, `terraform fmt`/
+  `validate` (no AWS credentials) plus `terraform plan` posted as a PR
+  comment (a read-only OIDC role) for infra changes, and a Docker build
+  sanity check (no push). Never applies, never pushes an image.
+- **`.github/workflows/deploy.yml`** - `workflow_dispatch` only, the *only*
+  workflow that ever mutates AWS. Builds+pushes a fresh image to dev's ECR
+  repo (dev target), promotes an already-built image into staging's/prod's
+  ECR repo via `crane copy` with no rebuild (staging/prod targets, "build
+  once, promote" - the same image is byte-identical everywhere it runs),
+  then runs `terraform apply -var="container_image_uri=..."` for whichever
+  environment was selected. `container_image_uri` is always supplied this
+  way, never committed to tracked `terraform.tfvars` (see `infra/terraform/github-oidc/`'s
+  design for why).
+- Both workflows authenticate to AWS via **OIDC federated IAM roles**
+  (`infra/terraform/github-oidc/`), not long-lived access-key secrets - one
+  shared read-only role for PR-triggered plans, one per-environment
+  write-scoped role for manual deploys. That module is applied once, by
+  hand, before either workflow can run - see the runbook.
+
 ## Known gotchas
 
 - **`VPC` network mode is deliberately not used.** `aws_bedrockagentcore_agent_runtime`
@@ -169,7 +208,9 @@ terraform apply
   address before relying on them, especially in prod.
 - **`terraform plan`/`apply` need real AWS credentials and the bootstrap
   bucket to exist.** `terraform validate` (schema/type checking, no
-  credentials needed) is what CI or a quick sanity check should run instead.
+  credentials needed) is what CI or a quick sanity check should run instead
+  - exactly the split `pr-validate.yml` uses (`tf-fmt-validate` needs no
+    credentials, `tf-plan` needs the read-only OIDC role, see "CI/CD" above).
 - **S3 Vectors IAM action names are plural ("Vectors"), not singular** -
   `modules/iam/knowledge_base_role.tf`'s `S3VectorsDataPlane` statement
   originally guessed singular (`GetVector`/`PutVector`/`DeleteVector`) from
@@ -219,7 +260,7 @@ scoped out - see `CLAUDE.md`'s Phase 02 notes):
 | `opensearch_collection_endpoint`  | *(none)*                          | not consumed directly - qual data goes through the Knowledge Base's `Retrieve` API instead of raw OpenSearch queries |
 | `gateway_url`                     | *(none)*                          | deferred - agents still call tools in-process, not via the Gateway |
 | `memory_id`                       | *(none)*                          | deferred - AgentCore Memory not yet wired into the graph |
-| `kb_docs_bucket_name`             | *(none)*                          | not app config - document ingestion is a separate manual/CI step |
+| `kb_docs_bucket_name`             | *(none)*                          | not app config - the *initial* document upload is a separate manual/CI step, but ongoing sync after that is automatic (`modules/kb-ingestion-sync`) |
 | `ecr_repository_url`              | *(none)*                          | CI/CD variable, not app config |
 | `agent_runtime_arn`               | *(none)*                          | CI/CD variable, not app config |
 

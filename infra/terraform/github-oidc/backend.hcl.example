@@ -1,0 +1,13 @@
+# Copy to backend.hcl (gitignored) and fill in with bootstrap's outputs:
+#   terraform -chdir=infra/terraform/bootstrap output state_bucket_name
+#   terraform -chdir=infra/terraform/bootstrap output state_bucket_region
+#
+# Then: terraform init -backend-config=backend.hcl
+#
+# Unlike bootstrap itself, this module has no chicken-and-egg problem with
+# its own state - the bucket already exists by the time this is applied - so
+# it uses a distinct key in the same bucket rather than local state.
+
+bucket = "amc-orchestrator-tfstate-<account-id>"
+key    = "github-oidc/terraform.tfstate"
+region = "us-east-1"
