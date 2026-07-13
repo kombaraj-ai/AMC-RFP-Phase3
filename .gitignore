@@ -48,4 +48,5 @@ backend.hcl
 crash.log
 crash.*.log
 infra/terraform/modules/lambda-tools/.build/
+infra/terraform/modules/kb-ingestion-sync/.build/
 

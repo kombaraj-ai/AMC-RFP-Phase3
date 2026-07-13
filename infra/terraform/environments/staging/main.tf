@@ -128,6 +128,23 @@ module "knowledge_base" {
   depends_on = [module.opensearch_index, module.s3_vectors]
 }
 
+module "kb_ingestion_sync" {
+  source = "../../modules/kb-ingestion-sync"
+  count  = var.enable_knowledge_base ? 1 : 0
+
+  name_prefix             = local.name_prefix
+  aws_region              = var.aws_region
+  docs_bucket_id          = module.s3_kb_docs.bucket_name
+  docs_bucket_arn         = module.s3_kb_docs.bucket_arn
+  knowledge_base_id       = module.knowledge_base[0].knowledge_base_id
+  data_source_id          = module.knowledge_base[0].data_source_id
+  ingestion_sync_role_arn = module.iam.kb_ingestion_sync_role_arn
+  log_retention_days      = var.log_retention_days
+  tags                    = local.common_tags
+
+  depends_on = [module.knowledge_base]
+}
+
 # --- Phase 3: agent runtime (see var.enable_agent_runtime) ----------------
 module "agentcore_memory" {
   source = "../../modules/agentcore-memory"
@@ -179,10 +196,14 @@ module "agentcore_runtime" {
 module "observability" {
   source = "../../modules/observability"
 
-  name_prefix           = local.name_prefix
-  aws_region            = var.aws_region
-  dynamodb_table_name   = module.dynamodb.table_name
-  lambda_function_names = values(module.lambda_tools.function_names)
+  name_prefix         = local.name_prefix
+  aws_region          = var.aws_region
+  dynamodb_table_name = module.dynamodb.table_name
+  lambda_function_names = concat(
+    values(module.lambda_tools.function_names),
+    var.enable_knowledge_base ? [module.kb_ingestion_sync[0].lambda_function_name] : [],
+  )
+  kb_ingestion_dlq_name = var.enable_knowledge_base ? module.kb_ingestion_sync[0].dlq_name : ""
   alarm_email           = var.alarm_email
   log_retention_days    = var.log_retention_days
   tags                  = local.common_tags

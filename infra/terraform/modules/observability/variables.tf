@@ -36,6 +36,12 @@ variable "dynamodb_throttle_alarm_threshold" {
   default = 1
 }
 
+variable "kb_ingestion_dlq_name" {
+  description = "modules/kb-ingestion-sync's dlq_name output. Empty string (default) skips the DLQ-depth alarm entirely - set when var.enable_knowledge_base is true."
+  type        = string
+  default     = ""
+}
+
 variable "tags" {
   type    = map(string)
   default = {}

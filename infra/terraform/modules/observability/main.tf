@@ -74,6 +74,29 @@ resource "aws_cloudwatch_metric_alarm" "dynamodb_throttles" {
   tags = var.tags
 }
 
+resource "aws_cloudwatch_metric_alarm" "kb_ingestion_dlq_depth" {
+  count = var.kb_ingestion_dlq_name != "" ? 1 : 0
+
+  alarm_name          = "${var.name_prefix}-kb-ingestion-dlq-depth"
+  comparison_operator = "GreaterThanOrEqualToThreshold"
+  evaluation_periods  = 1
+  metric_name         = "ApproximateNumberOfMessagesVisible"
+  namespace           = "AWS/SQS"
+  period              = 300
+  statistic           = "Maximum"
+  threshold           = 1
+  treat_missing_data  = "notBreaching"
+  alarm_description   = "KB ingestion-sync DLQ ${var.kb_ingestion_dlq_name} has failed messages - a document sync genuinely failed after retries"
+  alarm_actions       = [aws_sns_topic.alarms.arn]
+  ok_actions          = [aws_sns_topic.alarms.arn]
+
+  dimensions = {
+    QueueName = var.kb_ingestion_dlq_name
+  }
+
+  tags = var.tags
+}
+
 resource "aws_cloudwatch_dashboard" "amc_orchestrator" {
   dashboard_name = "${var.name_prefix}-amc-orchestrator"
 
