@@ -1,12 +1,13 @@
 # Architecture
 
-**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment)**
+**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment) + Phase 03 (CI/CD)**
 
-This document describes the system as actually implemented in `src/amc_orchestrator/` (Phase 01)
-and the AWS infrastructure that runs it in the cloud, as actually implemented in
-`infra/terraform/` (Phase 02). For day-to-day operational notes (how to resume work, known
-flakiness, milestone status), see [`CLAUDE.md`](../CLAUDE.md) at the repo root — that file is a
-working log; this one is the stable reference.
+This document describes the system as actually implemented in `src/amc_orchestrator/` (Phase 01),
+the AWS infrastructure that runs it in the cloud, as actually implemented in
+`infra/terraform/` (Phase 02), and the GitHub Actions pipeline that builds and deploys it
+(Phase 03 — `.github/workflows/` + `infra/terraform/github-oidc/`). For day-to-day operational
+notes (how to resume work, known flakiness, milestone status), see [`CLAUDE.md`](../CLAUDE.md) at
+the repo root — that file is a working log; this one is the stable reference.
 
 ## The problem
 
@@ -621,6 +622,126 @@ and a direct SigV4-signed `DELETE` HTTP call to the AOSS collection endpoint's i
 403'd, but `_cat/indices`/`_count`/a direct index `DELETE` all worked). A re-`plan`/`apply` after
 that succeeded clean with the new flags now in state for good.
 
+## Phase 03 — CI/CD (GitHub Actions)
+
+Everything above still describes how the system is built and deployed when a human runs Terraform
+and `docker build`/`push` by hand. Phase 03 automates that via two GitHub Actions workflows and a
+new Terraform root module for CI's own AWS identity — full operational steps live in
+[`ci_cd_runbook.md`](ci_cd_runbook.md); this section covers the design and why, in the same spirit
+as the rest of this document.
+
+**Four decisions, made explicitly with the user rather than assumed, shape everything below**:
+OIDC federated auth instead of long-lived access-key secrets; every deploy — including dev — is
+`workflow_dispatch`-only, nothing auto-deploys on merge; the same image is built once (in dev) and
+promoted byte-for-byte into staging's and prod's own ECR repos rather than rebuilt per environment;
+and no GitHub Environment required-reviewer gate on staging/prod.
+
+### `infra/terraform/github-oidc/` — CI's own AWS identity
+
+A standalone root module, sibling to `bootstrap/`/`environments/*` rather than nested in either —
+conceptually it's a repo-wide CI-identity concern spanning all three environments, not part of the
+state-bucket bootstrap or any one environment's phased apply. It reuses the state bucket
+`bootstrap/` already created as its own remote-backend key (unlike `bootstrap/` itself, this module
+has no chicken-and-egg problem — the bucket already exists by the time this applies), and is
+applied once, locally, by a human — the one piece of CI infrastructure that can't bootstrap itself,
+since CI can't create the very role it needs in order to authenticate at all.
+
+- **The OIDC provider's certificate thumbprint is fetched live** (`data "tls_certificate"` against
+  GitHub's own `.well-known/openid-configuration`), not hardcoded — the pattern the Terraform AWS
+  provider's own docs recommend for this exact resource, and it avoids silently going stale if
+  GitHub ever rotates their signing CA, a real, historical event for this specific provider.
+- **One shared, read-only `plan` role**, not one per environment. Trusted only for
+  `sub = "repo:<org>/<repo>:pull_request"` tokens (`StringEquals`, not `StringLike`) — used
+  exclusively by `pr-validate.yml`'s `tf-plan` job, which runs automatically on every PR including
+  from less-trusted pushes. Its permissions are the AWS-managed `ReadOnlyAccess` policy, not a
+  hand-rolled read policy — deliberately: `terraform plan` needs read access to essentially every
+  resource type this project's modules touch, and an incomplete custom read policy would silently
+  break `plan` on whatever action got missed, the exact class of bug this project already hit once
+  for real (`s3vectors:GetVectors` — see "Dev-only vector store choice" above). `ReadOnlyAccess`
+  guarantees zero mutating actions regardless of how complete a hand-written list would have been,
+  so the "a PR can never apply anything" safety property holds unconditionally. Shared rather than
+  per-environment because the blast radius of over-broad *read* access is low — three
+  near-identical roles would add real maintenance cost for no meaningful safety gain here.
+- **Three per-environment `deploy-<env>` roles**, trusted only for
+  `sub = "repo:<org>/<repo>:environment:<env>"` tokens. This is the actual safety property, not
+  just a workflow-YAML convention: GitHub only ever mints a token carrying an `environment:` claim
+  for a job that explicitly declares `environment: <env>`, which a `pull_request`-triggered job
+  never does — so even a misconfigured workflow can't get a PR run to assume a deploy role, the
+  trust policy itself refuses it, independent of whatever GitHub Environment protection-rule
+  settings happen to be configured. Permissions are scoped by resource-name-prefix
+  (`amc-orchestrator-<env>-*`) everywhere the target AWS service's ARN format supports it,
+  following the exact precedent already established in `modules/iam/lambda_execution_role.tf`'s
+  `CloudWatchLogsOwnFunctions` statement — this is what stops the new CI identity from quietly
+  undermining the project's existing isolation model (naming convention + separate Terraform
+  state, not separate AWS accounts — see "Three architectural decisions" above). A handful of
+  actions are AWS-imposed exceptions that need `Resource = "*"` regardless of scoping intent
+  (`ecr:GetAuthorizationToken`, most OpenSearch Serverless control-plane actions, `kms:CreateKey`,
+  Lambda event-source-mapping actions) — each is called out inline in `deploy_role.tf` so it
+  doesn't read as an oversight. One deliberate, commented crack in the per-environment isolation:
+  `deploy-staging`/`deploy-prod` also get narrow, read-only access to **dev's** ECR repo
+  specifically (never wildcarded), required for the promotion step below. A few S3 Vectors/
+  AgentCore action names are flagged as best-effort/unverified against a live apply, the same
+  honest-uncertainty pattern this project already uses for `S3VectorsDataPlane`'s real incident —
+  expect to add a missing action if a real apply through this role surfaces one.
+
+### `pr-validate.yml` — automatic, never mutates AWS
+
+Runs on every PR to `main`, gated per job by `dorny/paths-filter` so unrelated changes skip
+irrelevant work: ruff/mypy/`pytest tests/unit` for app changes, an arm64 Docker build sanity check
+(QEMU-emulated on the default x86_64 runner, `--output=type=cacheonly` so it validates the build
+without producing a real, pushable image) for Docker-relevant changes, and `terraform fmt`/
+`validate` (no AWS credentials — matches `infra/terraform/README.md`'s own long-standing claim that
+`validate` needs none) plus `terraform plan` (the read-only role above, output posted as an
+upserted PR comment per environment) for Terraform changes. The one deploy-adjacent thing it
+deliberately never does is apply or push — that invariant is what makes it safe to run unattended
+on every PR, including from a contributor whose intentions haven't been vetted.
+
+### `deploy.yml` — manual only, the only workflow that mutates AWS
+
+`workflow_dispatch`-only, three jobs. `build-and-push` (dev target only) builds fresh from source
+and tags with the full git commit SHA — the only place `docker build` ever runs. `promote`
+(staging/prod targets) copies that exact already-built image into the target environment's own ECR
+repo via `crane copy` rather than rebuilding — a registry-to-registry copy by manifest digest, no
+local `docker pull`/`push` round-trip and no QEMU needed at all, since `crane` never executes the
+image, only copies bytes — so what runs in staging/prod is guaranteed byte-identical to what was
+built and tested in dev, not merely "built from the same commit." `terraform-apply` declares
+`environment: <input>` (this is what resolves the job's Environment-scoped `AWS_DEPLOY_ROLE_ARN`
+variable and keeps GitHub's "restrict deployment branches to `main`" setting enforced), resolves
+the image URI, and passes it via `terraform apply -var="container_image_uri=..."` rather than
+committing it to tracked `terraform.tfvars` — a convention change from how dev's tfvars used to
+work (a real, hardcoded image tag committed to git), adopted across all three environments for
+consistency: it decouples app-deploy cadence from infra-config commits, and avoids repeating the
+same "real, environment-specific identifier checked into version control" pattern this phase
+otherwise moved away from. A `promote_image` boolean input lets an operator run a staging/prod
+pass-1/pass-2-only apply through this same generic workflow without forcing a meaningless
+promotion when `enable_agent_runtime` is still `false` and no image is involved yet — the same
+generic workflow handles a from-scratch, never-applied environment's entire first rollout, one pass
+at a time, with no special-cased pipeline logic (see `ci_cd_runbook.md`'s runbook sequence).
+
+### Two gotchas resolved explicitly with the user, not assumed
+
+1. **GitHub Environment required-reviewer gates don't let the person who triggered a run approve
+   their own deployment.** On a single-maintainer project, adding one to staging/prod would
+   deadlock every deploy unless a second GitHub account is always available to click approve — a
+   real, non-obvious practical constraint, not a hypothetical edge case. Resolved: no
+   required-reviewer gate at all. The manual `workflow_dispatch` trigger, OIDC role-scoping, and
+   restricting each Environment's deployment branch to `main` are the safety net instead.
+2. **The shared read-only plan role can't be Environment-scoped without quietly undermining its own
+   trust-policy safety property.** If `tf-plan` declared `environment: <env>` (the general
+   preference used everywhere else, so its variables could be Environment-scoped too), its OIDC
+   token would carry the same `sub` claim shape the deploy roles trust on — narrowing "a PR run can
+   never carry an `environment:` claim" right when it matters most. Resolved by keeping
+   `AWS_PLAN_ROLE_ARN`/`TF_STATE_BUCKET` as repo-level GitHub variables and never declaring
+   `environment:` on that job — `AWS_DEPLOY_ROLE_ARN` stays Environment-scoped since `deploy.yml`'s
+   jobs are supposed to carry that context.
+
+### Why GitHub Environment protection rules aren't Terraform-managed
+
+Codifying them via the `integrations/github` provider would need its own GitHub PAT/App
+credential — a whole new credential surface for a one-time, rarely-changed setting. For a
+single-maintainer project that trade-off isn't worth it; [`ci_cd_runbook.md`](ci_cd_runbook.md)
+documents the one-time manual steps instead.
+
 ## Repository map
 
 ```
@@ -660,11 +781,13 @@ src/amc_orchestrator/
 ```
 
 `Dockerfile` lives at the repo root (sibling to `src/`, `infra/`) — builds the image
-`runtime_entrypoint.py` runs inside, pushed to the ECR repo `infra/terraform/modules/ecr` creates.
+`runtime_entrypoint.py` runs inside, normally built/pushed by `.github/workflows/deploy.yml` (see
+"Phase 03" below), pushed to the ECR repo `infra/terraform/modules/ecr` creates.
 
 ```
 infra/terraform/
 ├── bootstrap/                     # one-time: S3 state bucket, its own local state
+├── github-oidc/                   # one-time: GitHub Actions OIDC provider + plan/deploy IAM roles (Phase 03)
 ├── modules/                       # reusable, environment-agnostic (see table above)
 │   ├── iam/  ecr/  s3-kb-docs/  dynamodb/
 │   ├── opensearch-serverless/  opensearch-access-policy/  opensearch-index/
@@ -676,4 +799,10 @@ infra/terraform/
     ├── dev/       # cheapest defaults: no CMKs, single-AZ OpenSearch, short retention
     ├── staging/   # mirrors prod's security posture (CMKs, HA) for pre-prod validation
     └── prod/      # full HA + longest retention + deletion protection everywhere
+```
+
+```
+.github/workflows/                 # Phase 03 - see "Phase 03 — CI/CD" above
+├── pr-validate.yml                # automatic on every PR: lint/type/unit tests, docker build sanity, terraform fmt/validate/plan
+└── deploy.yml                     # workflow_dispatch only: build+push (dev), promote via crane (staging/prod), terraform apply
 ```

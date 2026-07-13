@@ -893,3 +893,222 @@ created, set `enable_agent_runtime = true` (and `container_image_uri`),
 apply - the first real, invokable AgentCore Runtime. Real AWS action
 (image push + apply), should be confirmed with the user first, not
 auto-run.
+
+### Auto-sync RAG pipeline: S3 → Knowledge Base ingestion (2026-07-13)
+
+Closed the "manual ingestion" gap flagged throughout this doc and in
+`data/knowledge_base_store.py`'s `ensure_seeded()` docstring - the *initial*
+document upload to the S3 docs bucket is still a separate, manual/CI step
+(unchanged), but every upload/delete **after** that now auto-syncs the
+Knowledge Base without a manual `start_ingestion_job` call. Adapted from a
+reference article's S3→SQS→Lambda→`bedrock-agent:StartIngestionJob` pattern
+(dev.to/suhas_mallesh) to this repo's own conventions - confirmed via a
+full-repo search that no SQS queue or `aws_s3_bucket_notification` existed
+anywhere before this, a net-new capability, not a fix.
+
+New: `infra/terraform/modules/kb-ingestion-sync/` (SQS queue + DLQ, S3
+bucket notification, Lambda + event source mapping - `batch_size=10` +
+`maximum_batching_window_in_seconds=300` is the sole debounce mechanism,
+so many rapid S3 events collapse into one ingestion job since Bedrock only
+allows one running job per data source at a time; the reference article's
+extra SQS-level `delay_seconds` was deliberately dropped as redundant with
+this AWS-native mechanism - user-confirmed choice). Lambda handler
+(`sync_src/handler.py`) catches `ConflictException` from a still-running
+job as a success (ingestion is incremental, the running job already covers
+the new files), any other `ClientError` re-raises so SQS redrives to the
+DLQ after 3 attempts.
+
+**IAM decision (user-confirmed, surfaced explicitly rather than picked
+silently)**: `modules/iam/kb_ingestion_sync_role.tf`'s
+`bedrock:StartIngestionJob` statement is wildcarded to
+`knowledge-base/*` rather than scoped to the real KB ARN - the real ARN
+doesn't exist until Pass 2 (`module.knowledge_base`), but this role is
+created in Pass 1 (`modules/iam`), and scoping it precisely would recreate
+the exact iam↔knowledge_base module cycle already solved once for
+OpenSearch's access policy (see `modules/opensearch-access-policy`'s own
+history above). Accepted trade-off: grants the ability to *trigger*
+ingestion jobs account-wide, not read/write KB content. The role's SQS
+permissions use the same predictable-ARN-by-naming-convention precedent as
+`lambda_execution_role.tf`'s `CloudWatchLogsOwnFunctions` statement, so no
+new cross-module ARN wiring was needed there either.
+
+DLQ failures alert through the *existing* shared `aws_sns_topic.alarms` in
+`modules/observability` (new `kb_ingestion_dlq_depth` alarm, gated on
+`var.kb_ingestion_dlq_name != ""`) rather than a new topic - user-confirmed,
+one place to subscribe.
+
+Wired into all three environments identically (`module.kb_ingestion_sync`,
+`count = var.enable_knowledge_base ? 1 : 0`, alongside `module.knowledge_base`
+in the existing Pass-2 block) - modules stay environment-agnostic per this
+repo's own "Adding a 4th environment" convention, only tfvars differ.
+`infra/terraform/README.md`'s Pass-2 section and Settings-mapping table
+updated to reflect ongoing sync now being automatic.
+
+**Verified so far**: `terraform fmt -recursive` clean. `terraform validate`
+- see below for per-environment result. **Not yet applied to real AWS** -
+per this project's own discipline (3+ real apply-time bugs so far were
+never caught by `validate` alone), a real `terraform plan` dry-run against
+dev and an actual apply + live test (drop a file in the docs bucket, watch
+`start_ingestion_job` fire) are the next steps, both requiring the user's
+explicit go-ahead before running.
+
+## Phase 03 — CI/CD Implementation (GitHub Actions)
+
+Started 2026-07-13, same session as the kb-ingestion-sync work above. User
+requested a detailed analysis + implementation plan first (Plan Mode), then
+approved it after 4 rounds of `AskUserQuestion` locking in the design: OIDC
+federated auth (not long-lived keys), fully manual deploy triggers
+everywhere (no auto-deploy on merge, not even dev), build-once/promote-the-
+same-image across environments (not rebuild-per-env), and no GitHub
+Environment required-reviewer gate on staging/prod (avoids the
+solo-maintainer deadlock where GitHub won't let the person who triggered a
+run approve their own deployment).
+
+**Repo hosting is explicitly out of scope** - the user is handling GitHub
+repo creation/push separately; `git remote -v` was empty at the start of
+this work and still is. Everything below is designed to work once `origin`
+exists, not verified against a real GitHub Actions run yet (can't be,
+without a pushed repo) - **`terraform fmt`/`validate` are the only things
+actually verified so far** (see below), same as every other not-yet-applied
+piece of Terraform in this project.
+
+### What was built
+
+- **`infra/terraform/github-oidc/`** - new standalone root module (sibling
+  to `bootstrap/`/`environments/*`, not nested in either - reuses the
+  existing state bucket as its own backend key rather than local state,
+  since unlike `bootstrap/` itself this module has no chicken-and-egg
+  problem: the bucket already exists by the time this applies).
+  - `aws_iam_openid_connect_provider` for
+    `token.actions.githubusercontent.com`, thumbprint fetched live via
+    `data "tls_certificate"` rather than hardcoded (the
+    Terraform-documented pattern for this resource - avoids going stale on
+    a CA rotation, a real historical event for this exact provider).
+  - One shared, read-only `plan` role (AWS managed `ReadOnlyAccess`,
+    trusted only for `sub = "repo:<org>/<repo>:pull_request"` tokens) -
+    used by `pr-validate.yml`'s `tf-plan` job on every PR, including from
+    less-trusted pushes. Deliberately AWS-managed rather than hand-rolled:
+    an incomplete custom read policy would silently break `terraform plan`
+    on whatever action got missed, the same class of bug this project has
+    already hit once for real (`s3vectors:GetVectors` singular-vs-plural,
+    see the Phase 02 history above) - `ReadOnlyAccess` guarantees zero
+    mutating actions regardless of completeness.
+  - Three per-environment `deploy-<env>` roles (write-scoped, trusted only
+    for `sub = "repo:<org>/<repo>:environment:<env>"` tokens - GitHub only
+    mints that claim for a job that explicitly declares
+    `environment: <env>`, so even a misconfigured workflow can't get a
+    PR-triggered run to assume one). Permissions scoped by resource-name-
+    prefix (`amc-orchestrator-<env>-*`) everywhere the target AWS service's
+    ARN format allows it, following the exact precedent already in
+    `modules/iam/lambda_execution_role.tf`'s `CloudWatchLogsOwnFunctions`
+    statement - this is what keeps the CI identity from quietly
+    undermining the project's existing dev/staging/prod isolation model
+    (naming convention + separate state, not separate AWS accounts, per
+    the Phase 02 "locked-in architecture decisions" above). One deliberate
+    exception: `deploy-staging`/`deploy-prod` also get narrow read-only
+    access to **dev's** ECR repo specifically (not wildcarded), required
+    for the promote step below. A handful of action names (S3 Vectors/
+    AgentCore control-plane calls) are flagged in code comments as
+    best-effort/unverified, the same honest-uncertainty pattern already
+    used for `S3VectorsDataPlane`'s real incident.
+- **`.github/workflows/pr-validate.yml`** - automatic on every PR to
+  `main`, path-filtered via `dorny/paths-filter` so unrelated changes skip
+  irrelevant jobs: ruff/mypy/`pytest tests/unit` for app changes, an arm64
+  Docker build sanity check (QEMU-emulated, `--output=type=cacheonly`,
+  never pushes) for Docker-relevant changes, and `terraform fmt`/`validate`
+  (no credentials) + `terraform plan` (the read-only OIDC role, posted/
+  upserted as a PR comment per environment) for Terraform changes. Never
+  applies, never pushes an image - the explicit design invariant that
+  makes it safe to run unattended on every PR.
+- **`.github/workflows/deploy.yml`** - `workflow_dispatch` only, the *only*
+  workflow that ever touches AWS. Three jobs: `build-and-push` (dev target
+  only - builds fresh from source, tags with the full git SHA, pushes),
+  `promote` (staging/prod targets - `crane copy`s that exact already-built
+  dev image into the target env's own ECR repo by digest, no rebuild, no
+  QEMU needed since crane never executes the image), `terraform-apply`
+  (declares `environment: <input>` so GitHub's Environment-scoped
+  variables and deployment-branch restriction apply, resolves the image
+  URI and passes it via `-var="container_image_uri=..."` rather than
+  committing it to tracked tfvars - a convention change from how dev's
+  tfvars used to work, see below). A `promote_image` boolean input lets an
+  operator run a staging/prod pass-1/pass-2-only apply through this same
+  generic workflow without forcing a meaningless promotion when no image
+  is involved yet.
+- **`.dockerignore`** added (didn't exist before) - excludes `.venv/`,
+  `.git/`, `.github/`, `.claude/`, `data/`, `local_dev.db`, `docs/`,
+  `infra/`, `tests/`, caches, `environments/.env*`.
+- **tfvars changes**: staging/prod's `bedrock_model_id` fixed off the EOL
+  Claude model (`amazon.nova-lite-v1:0`, matching dev's already-proven
+  value - staging/prod had never been applied, so this was silently stale
+  until now, not yet a live bug). dev's `container_image_uri` cleared to
+  `""` (normalizing it onto the same `-var`-at-apply-time convention
+  staging/prod now use, rather than the real, environment-specific image
+  tag it used to hardcode) - user-confirmed this touches a live
+  environment's tracked config but is a no-op at the AWS level (same
+  image URI, just supplied differently at the next apply). All three
+  tfvars got placeholder comments marking exactly where each
+  environment's `deploy-<env>` role ARN goes in
+  `additional_data_access_principals`, once `github-oidc/` is applied.
+- **`docs/ci_cd_runbook.md`** (new) - the one-time GitHub-side manual setup
+  (Environments, deployment-branch restriction, repo/Environment
+  variables) and the full staging/prod first-ever-rollout sequence through
+  `deploy.yml`, since neither has ever been applied. Deliberately NOT
+  Terraform-managed via the `integrations/github` provider - would need
+  its own GitHub PAT/App credential, a new credential surface not worth it
+  for a one-time, rarely-changed setting on a single-maintainer project.
+- `infra/terraform/README.md` and this file's docs siblings
+  (`docs/architecture.md`, `docs/user_guide.md`) updated with a matching
+  Phase 03 section each.
+
+### Design decisions surfaced explicitly, not picked silently
+
+Two practical gotchas came up mid-design and were resolved with the user
+rather than assumed:
+
+1. **GitHub Environment required-reviewer gates don't let the triggering
+   user approve their own deployment.** For a true solo maintainer, adding
+   one to staging/prod would deadlock every deploy unless a second GitHub
+   account is always on hand to click approve. User chose no
+   required-reviewer gate at all - the manual `workflow_dispatch` trigger
+   + OIDC role-scoping + restricting each Environment's deployment branch
+   to `main` is the safety net instead.
+2. **The shared read-only plan role can't be Environment-scoped without
+   undermining its own trust-policy safety property.** If `tf-plan`
+   declared `environment: <env>` (to read Environment-scoped variables,
+   the general preference for `deploy.yml`'s jobs), its OIDC token would
+   carry the same `sub` claim shape the deploy roles trust, weakening "a
+   PR run can never carry an `environment:` claim." Resolved by keeping
+   `AWS_PLAN_ROLE_ARN`/`TF_STATE_BUCKET` as **repo-level** GitHub
+   variables and never declaring `environment:` on that job at all -
+   `vars.AWS_DEPLOY_ROLE_ARN` stays Environment-scoped since `deploy.yml`'s
+   jobs are supposed to carry that context.
+
+### Verified so far
+
+`terraform fmt -check -recursive` (from `infra/terraform/`) and
+`terraform validate` (via `terraform init -backend=false`, no AWS
+credentials) both pass clean on the new `github-oidc/` module and on all
+three `environments/{dev,staging,prod}` after the tfvars edits. Both
+workflow YAML files parse cleanly (`yaml.safe_load`). **Nothing has been
+applied to real AWS yet, and no GitHub Actions run has ever fired** - the
+repo still has no `git remote` configured (the user's own next step, out
+of scope for this work), and even once pushed, `infra/terraform/github-oidc/`
+still needs a one-time local `terraform apply` (chicken-and-egg - CI can't
+create the IAM role it needs to authenticate) before either workflow can
+do anything beyond `pr-validate.yml`'s no-credentials jobs. See
+`docs/ci_cd_runbook.md` for the exact sequence.
+
+### Immediate next step (resume here)
+
+1. User pushes the repo to GitHub (their own next step, not done as part
+   of this work).
+2. `docs/ci_cd_runbook.md` step 1: fill in
+   `infra/terraform/github-oidc/terraform.tfvars` with the real
+   `github_org`/`github_repo`, apply it locally, capture
+   `deploy_role_arns`/`plan_role_arn` outputs.
+3. `docs/ci_cd_runbook.md` steps 2-3: create the three GitHub Environments,
+   set the repo-level and per-Environment variables.
+4. Dispatch `deploy.yml` for `dev` first (already-live environment, lowest
+   risk) as the first real end-to-end proof the pipeline works, before
+   attempting staging/prod's first-ever rollout (`docs/ci_cd_runbook.md`
+   section 4).

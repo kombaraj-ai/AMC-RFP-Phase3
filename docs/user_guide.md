@@ -1,12 +1,13 @@
 # User Guide
 
-**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment)**
+**AMC RFP & Portfolio Insight Orchestrator — Phase 01 (DEV) + Phase 02 (AWS deployment) + Phase 03 (CI/CD)**
 
 This is the practical, task-oriented companion to [`architecture.md`](architecture.md). It covers
 setup, running the system locally three ways (CLI, API, and a Streamlit UI), the mock data you
-can query against, troubleshooting, and (as of Phase 02) deploying the AWS infrastructure via
+can query against, troubleshooting, (as of Phase 02) deploying the AWS infrastructure via
 Terraform and testing the live, deployed AgentCore Runtime directly - no local server or Ollama
-involved at all. Examples use `uv` and PowerShell, matching this project's actual dev environment
+involved at all - and (as of Phase 03) the GitHub Actions pipeline that automates those same
+deploy steps. Examples use `uv` and PowerShell, matching this project's actual dev environment
 (Windows, `uv`-managed Python).
 
 ## Prerequisites
@@ -685,6 +686,50 @@ with nothing left behind — confirm with `terraform state list` (empty output m
 is fully torn down; a fresh `terraform apply`, all three passes, is required before using it
 again).
 
+## CI/CD (Phase 03)
+
+Phase 03 automates the manual `terraform apply`/`docker build`/`docker push` commands above via
+two GitHub Actions workflows (`.github/workflows/pr-validate.yml`, `.github/workflows/deploy.yml`)
+and a new Terraform root module for CI's own AWS identity (`infra/terraform/github-oidc/`). Full
+one-time setup steps and the staging/prod first-rollout sequence live in
+[`ci_cd_runbook.md`](ci_cd_runbook.md) — this section is just the map, not the territory. See
+[`architecture.md`](architecture.md#phase-03--cicd-github-actions) for the design and why.
+
+**One-time setup** (before either workflow can do anything beyond `pr-validate.yml`'s
+no-credentials jobs):
+
+```powershell
+cd infra/terraform/github-oidc
+cp backend.hcl.example backend.hcl
+cp terraform.tfvars.example terraform.tfvars   # fill in your real github_org/github_repo
+terraform init -backend-config=backend.hcl
+terraform apply
+terraform output deploy_role_arns
+terraform output plan_role_arn
+```
+
+Then create the three GitHub Environments (`dev`/`staging`/`prod`, restricted to the `main`
+branch) and set the repo-level and per-Environment variables those outputs feed — exact steps in
+[`ci_cd_runbook.md`](ci_cd_runbook.md).
+
+**On every pull request to `main`**, `pr-validate.yml` runs automatically — lint, type check, unit
+tests, a Docker build sanity check, and (for Terraform changes) `terraform fmt`/`validate` plus a
+`terraform plan` posted as a PR comment. Nothing here ever touches AWS beyond that read-only plan.
+
+**To actually deploy**, dispatch `deploy.yml` manually — GitHub UI (Actions tab → Deploy → Run
+workflow) or:
+
+```powershell
+gh workflow run deploy.yml -f environment=dev
+# staging/prod also need image_tag - an already dev-built git-SHA tag to promote:
+gh workflow run deploy.yml -f environment=staging -f image_tag=<sha> -f promote_image=true
+```
+
+Nothing auto-deploys on merge, for any environment, including dev — every deploy is an explicit,
+deliberate action. Staging/prod deliberately have no required-reviewer approval gate either (see
+[`ci_cd_runbook.md`](ci_cd_runbook.md) for why - it would deadlock a single-maintainer setup) - the
+manual trigger itself, plus the OIDC role scoping, is the safety net.
+
 ## Troubleshooting
 
 **A query is taking a long time. Is it stuck?**
@@ -715,5 +760,6 @@ vector search. One-time cost; cached locally afterward.
 
 **Integration tests are being skipped.**
 They auto-skip (not fail) if Ollama isn't reachable at `Settings.ollama_host` — this is
-intentional so the fast unit suite (and CI, once it exists) never depends on a local LLM being
-up. Start Ollama and re-run if you want them to actually execute.
+intentional so the fast unit suite (and `pr-validate.yml`'s `unit-tests` job, which only ever runs
+`tests/unit`) never depends on a local LLM being up. Start Ollama and re-run if you want them to
+actually execute.
