@@ -27,7 +27,15 @@ def ensure_seeded(table_name: str) -> None:
     in the table is never clobbered by a re-seed."""
     table = _table(table_name)
     for row in _MOCK_FUNDS:
-        item = dict(zip(_COLUMNS, row, strict=True))
+        # boto3's high-level Table resource rejects native Python `float` for
+        # DynamoDB numeric attributes (`TypeError: Float types are not
+        # supported. Use Decimal types instead.`) - `_MOCK_FUNDS` reuses
+        # sqlite_store's plain-float literals, so convert here rather than
+        # duplicate the mock data with Decimal literals.
+        item = {
+            key: Decimal(str(value)) if isinstance(value, float) else value
+            for key, value in zip(_COLUMNS, row, strict=True)
+        }
         try:
             table.put_item(Item=item, ConditionExpression="attribute_not_exists(ticker)")
         except ClientError as exc:
