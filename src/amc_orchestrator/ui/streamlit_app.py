@@ -22,6 +22,14 @@ try/except-around-`graph(...)` safety net (see CLAUDE.md "Bug #2") and
 always return a well-formed `RfpOutcome`, even on escalation. Only
 connection/timeout/credential errors are this layer's problem.
 
+A sidebar "Admin: Upload KB documents" expander is independent of connection
+mode (it's a plain S3 `PutObject`, same active AWS credentials as Runtime
+mode) - lets a tester drop fund-commentary docs straight into the KB docs
+bucket without leaving the UI. No manual ingestion call needed afterward;
+`infra/terraform/modules/kb-ingestion-sync` auto-triggers a Bedrock
+ingestion job on upload (see `docs/sample_invocation_walkthrough.md`'s
+"S3 Auto Sync - Inner working" section).
+
 Run with: `uv run streamlit run src/amc_orchestrator/ui/streamlit_app.py`
 """
 
@@ -206,6 +214,88 @@ def render_runtime_connection() -> None:
         )
 
 
+def upload_docs_to_s3(
+    region: str, bucket: str, files: list
+) -> list[tuple[str, bool, str | None]]:
+    """Upload each file as-is to the KB docs bucket via a direct S3 PutObject.
+
+    Uses whatever AWS credentials are already active, same as Runtime mode.
+    No separate ingestion call is needed afterward - the bucket has an S3
+    event notification wired to `modules/kb-ingestion-sync`, which
+    auto-triggers a Bedrock ingestion job within its ~5 minute batching
+    window (see `docs/sample_invocation_walkthrough.md`'s "S3 Auto Sync -
+    Inner working" section for the full chain).
+    """
+    client = boto3.client("s3", region_name=region)
+    results: list[tuple[str, bool, str | None]] = []
+    for f in files:
+        try:
+            client.put_object(Bucket=bucket, Key=f.name, Body=f.getvalue())
+            results.append((f.name, True, None))
+        except (ClientError, BotoCoreError) as exc:
+            results.append((f.name, False, str(exc)))
+    return results
+
+
+def list_docs_in_bucket(region: str, bucket: str) -> list[dict[str, Any]] | None:
+    try:
+        client = boto3.client("s3", region_name=region)
+        response = client.list_objects_v2(Bucket=bucket)
+    except (ClientError, BotoCoreError):
+        return None
+    return [
+        {
+            "Key": obj["Key"],
+            "Size (bytes)": obj["Size"],
+            "Last modified": obj["LastModified"].strftime("%Y-%m-%d %H:%M:%S"),
+        }
+        for obj in response.get("Contents", [])
+    ]
+
+
+def render_docs_admin() -> None:
+    with st.sidebar.expander("📄 Admin: Upload KB documents"):
+        st.text_input(
+            "S3 docs bucket",
+            key="kb_docs_bucket",
+            value=st.session_state.kb_docs_bucket,
+            help=(
+                "From `terraform output kb_docs_bucket_name` in "
+                "`infra/terraform/environments/<env>/`."
+            ),
+        )
+        uploaded = st.file_uploader(
+            "Fund commentary documents",
+            accept_multiple_files=True,
+            key="kb_upload_widget",
+            help="Uploaded as-is to the KB docs bucket; auto-sync ingestion picks them up within ~5 minutes.",
+        )
+        bucket = st.session_state.kb_docs_bucket.strip()
+
+        if st.button("Upload to S3", width="stretch", disabled=not (bucket and uploaded)):
+            results = upload_docs_to_s3(st.session_state.aws_region, bucket, uploaded)
+            for name, ok, error in results:
+                if ok:
+                    st.success(f"Uploaded `{name}`")
+                else:
+                    st.error(f"`{name}` failed: {error}")
+            if any(ok for _, ok, _ in results):
+                st.info(
+                    "Auto-sync ingestion will pick this up within ~5 minutes "
+                    "(no manual `start_ingestion_job` needed).",
+                    icon="🔄",
+                )
+
+        if st.button("List documents in bucket", width="stretch", disabled=not bucket):
+            docs = list_docs_in_bucket(st.session_state.aws_region, bucket)
+            if docs is None:
+                st.error("Could not list bucket - check bucket name/region/credentials.")
+            elif not docs:
+                st.caption("Bucket is empty.")
+            else:
+                st.dataframe(docs, hide_index=True, width="stretch")
+
+
 def render_sidebar(settings) -> None:
     st.sidebar.header("Connection")
     st.sidebar.radio(
@@ -241,6 +331,9 @@ def render_sidebar(settings) -> None:
     st.sidebar.divider()
     st.sidebar.header("Fund reference")
     st.sidebar.dataframe(FUND_REFERENCE, hide_index=True, width="stretch")
+
+    st.sidebar.divider()
+    render_docs_admin()
 
 
 def render_result(outcome: dict[str, Any], elapsed: float) -> None:
@@ -327,6 +420,8 @@ def main() -> None:
         st.session_state.aws_region = settings.aws_region
     if "agent_runtime_arn" not in st.session_state:
         st.session_state.agent_runtime_arn = ""
+    if "kb_docs_bucket" not in st.session_state:
+        st.session_state.kb_docs_bucket = ""
     if "request_timeout" not in st.session_state:
         st.session_state.request_timeout = 600
     if "question_text" not in st.session_state:
