@@ -313,6 +313,7 @@ the app for ECR.
 | Quant metrics | DynamoDB, `PAY_PER_REQUEST`, `ticker` as the sole key — mirrors `sqlite_store.py`'s schema | `dynamodb` |
 | Qual vector store | OpenSearch Serverless collection (`VECTORSEARCH`) + its security/access policies (staging/prod always; dev's default) — or, dev-only, an S3 Vectors bucket + index (`vector_store_backend = "s3_vectors"`, see below) | `opensearch-serverless`, `opensearch-access-policy`, `opensearch-index` — or `s3-vectors` |
 | Qual RAG | Bedrock Knowledge Base + S3 data source, backed by whichever vector store above is selected | `knowledge-base`, `s3-kb-docs` |
+| Ingestion automation | S3 event → SQS (batches ~5 min) → Lambda → `bedrock-agent:StartIngestionJob`, DLQ + alarm on genuine failure — see below | `kb-ingestion-sync` |
 | Tool compute | Stub Lambda functions behind the Gateway targets (placeholder logic — see below) | `lambda-tools` |
 | Container registry | ECR repo for the runtime's image (Terraform never builds/pushes into it) | `ecr` |
 | Access control | One IAM role per AWS-service consumer (runtime, gateway, lambda, knowledge base) | `iam` |
@@ -398,6 +399,84 @@ consistent with this project's own M0 precedent. The same apply also confirmed
 `"cosine"`) work — the vector bucket and index were created successfully before the IAM issue
 surfaced on the Knowledge Base resource specifically.
 
+### Auto-sync ingestion: S3 events to Bedrock Knowledge Base
+
+Added after the initial Phase 02 build, once it became clear that requiring a manual
+`start-ingestion-job` call after every single document change (see "Enabling the Knowledge Base
+and ingesting documents" in [`user_guide.md`](user_guide.md)) didn't scale past the first
+one-off ingestion. `modules/kb-ingestion-sync`, created alongside `modules/knowledge-base` in the
+same Pass 2 (`enable_knowledge_base = true`, no separate flag), closes that gap for every upload
+or deletion *after* the first:
+
+```
+S3 docs bucket ──(ObjectCreated:*/ObjectRemoved:*)──► SQS queue
+                                                            │
+                                        aws_lambda_event_source_mapping
+                                        (batch_size=10, maximum_batching_window_in_seconds=300)
+                                                            ▼
+                                        Lambda: kb-ingestion-sync (Python 3.13)
+                                        boto3 bedrock-agent.start_ingestion_job(...)
+                                                            │
+                                        (3 failed attempts → redrive_policy)
+                                                            ▼
+                                                    SQS DLQ ──► CloudWatch alarm ──► existing
+                                                                                     modules/observability
+                                                                                     SNS topic
+```
+
+Three decisions worth knowing, each surfaced as an explicit choice rather than picked silently
+(this project's standing convention for infra work):
+
+1. **Batching uses only the Lambda event-source-mapping's `maximum_batching_window_in_seconds`
+   (AWS-native)**, not an additional SQS-level `delay_seconds` some reference implementations of
+   this pattern also set — the two would overlap in effect, and the event-source-mapping window is
+   the mechanism AWS purpose-built for exactly this "debounce many events into one invocation"
+   case. This matters because Bedrock only allows **one running ingestion job per data source at a
+   time** — without batching, N rapid S3 events would fire N concurrent `StartIngestionJob` calls,
+   most of which would fail with `ConflictException`. The handler
+   (`modules/kb-ingestion-sync/sync_src/handler.py`) treats that specific exception as a success
+   anyway (ingestion is incremental — a job already in flight will pick up the files that triggered
+   the *next* invocation too), so the batching window is a cost/latency optimization on top of an
+   already-correct fallback, not the only thing standing between this and duplicate-job errors.
+2. **`bedrock:StartIngestionJob` is wildcarded to `knowledge-base/*`, not scoped to the one real KB
+   ARN** (`modules/iam/kb_ingestion_sync_role.tf`). The real ARN doesn't exist until Pass 2
+   (`module.knowledge_base`), but this role is created in Pass 1 (`modules/iam`) — scoping it
+   precisely would recreate the exact `iam`↔`knowledge_base` module cycle already solved once for
+   OpenSearch's access policy (see decision 3 under "Three architectural decisions" above).
+   Accepted, user-confirmed trade-off: this grants the ability to *trigger* ingestion jobs
+   account-wide, not read/write Knowledge Base content. The role's SQS permissions instead use the
+   *predictable-ARN-by-naming-convention* precedent already established by
+   `lambda_execution_role.tf`'s `CloudWatchLogsOwnFunctions` statement, avoiding a second cycle
+   without wildcarding anything SQS-related.
+3. **DLQ failures alert through the existing shared `aws_sns_topic.alarms` in
+   `modules/observability`**, not a new topic — one CloudWatch alarm
+   (`kb_ingestion_dlq_depth`, gated on `var.kb_ingestion_dlq_name != ""`) added alongside the
+   pre-existing Lambda-error/DynamoDB-throttle alarms, so there's one place to subscribe
+   (`var.alarm_email`) rather than a second topic to remember.
+
+**Live-verified end-to-end, 2026-07-13** (not just `validate`/`plan`-clean): applied to real AWS
+and exercised through a full round trip, no manual `start-ingestion-job` call made for any of it —
+uploading a file triggered an automatic ingestion job (`numberOfNewDocumentsIndexed: 1`), deleting
+it triggered another that correctly removed the corresponding vector (`numberOfDocumentsDeleted:
+1`, confirmed absent from a subsequent `Retrieve` call), and re-uploading it restored the vector
+(`numberOfNewDocumentsIndexed: 1` again). One real bug found and fixed along the way:
+`modules/iam/kb_ingestion_sync_role.tf`'s `CloudWatchLogsOwnFunction` statement scoped its
+resource to the bare log-group ARN, missing the trailing `:*` needed for log-stream-level actions
+(`CreateLogStream`/`PutLogEvents`) — 6 real, successful (0-error) Lambda invocations produced zero
+CloudWatch log streams before the fix, log delivery being best-effort and not blocking the
+invocation itself. Matches AWS's own `AWSLambdaBasicExecutionRole` pattern
+(`log-group:/aws/lambda/*:*"`), unlike `lambda_execution_role.tf`'s equivalent statement (see
+decision 2 above), whose wildcard already sits inside the log-group *name*, incidentally covering
+the stream-level suffix too.
+
+**What this does not change**: the *first* time a document needs to exist in the Knowledge Base at
+all, someone still has to upload it to the S3 docs bucket — Terraform never populates the bucket,
+and this pipeline only reacts to bucket changes, it doesn't originate them. See
+[`user_guide.md`](user_guide.md#enabling-the-knowledge-base-and-ingesting-documents-pass-2-in-full)
+for the exact upload steps and how the automatic sync fits alongside the still-available manual
+`start-ingestion-job` trigger (useful when testing and you don't want to wait out the batching
+window).
+
 ### The app-code follow-on: AgentCore entrypoint + DynamoDB/Knowledge Base data layer
 
 The gap called out above — no entrypoint, no Dockerfile, no cloud-backed data layer — is closed.
@@ -410,12 +489,22 @@ as in Phase 01, just repointed at DynamoDB/a Bedrock Knowledge Base instead of S
   DEV can opt in, STAGING/PROD always resolve to `"aws"`.
 - **`data/dynamodb_store.py`** — same `ensure_seeded`/`fetch_fund_performance` shape as
   `sqlite_store.py`, converting DynamoDB's `Decimal` to `float` before returning so
-  `tools/quant_tools.py`'s `json.dumps(row)` keeps working unchanged.
+  `tools/quant_tools.py`'s `json.dumps(row)` keeps working unchanged. The reverse direction needs
+  the same care: `ensure_seeded`'s `put_item` calls convert `_MOCK_FUNDS`' plain Python `float`
+  literals to `Decimal` before writing — boto3's high-level `Table` resource rejects native
+  `float` outright (`TypeError: Float types are not supported. Use Decimal types instead.`). Found
+  via a real local repro (`DATA_BACKEND=aws` CLI run): this would have crashed the deployed
+  Runtime's `lifespan` seeding hook on any fresh cold start (the running dev container just hadn't
+  restarted since an earlier working state). Fixed, and confirmed the fix doesn't touch
+  already-seeded rows — the existing `ConditionExpression` still correctly no-ops on items already
+  present.
 - **`data/knowledge_base_store.py`** — calls Bedrock's managed `Retrieve` API against the
   Knowledge Base Terraform already provisions, rather than hand-rolling raw OpenSearch k-NN
   queries plus our own embedding calls; the KB resource exists specifically to do that
   end-to-end. `ensure_seeded` here is a deliberate no-op (KB ingestion is an S3-upload +
-  `start_ingestion_job` operation, not safe to run implicitly on every app startup).
+  `start_ingestion_job` operation, not safe to run implicitly on every app startup — and since the
+  "Auto-sync ingestion" section below, the `start_ingestion_job` half of that already happens on
+  its own once a document lands in S3, so there's even less reason for app startup to touch it).
 - **`data/quant_store.py`/`data/qual_store.py`** — thin facades dispatching on
   `effective_data_backend`, the only place that chooses between the local and AWS store. Only 4
   existing files were touched to call the facade instead of the concrete store directly
@@ -481,6 +570,23 @@ driven via a small Node script): default state unchanged, mode switch shows the 
 entering the real deployed Runtime ARN shows a genuine "Runtime READY" badge, and submitting the
 INC2 example query in Runtime mode returned a real synthesized report (Approved, 1 compliance
 attempt, 8.3s) rendered correctly via the existing result view.
+
+### Streamlit Admin panel: uploading KB documents from the UI
+
+A sidebar "📄 Admin: Upload KB documents" expander (collapsed by default, and independent of the
+Local/Runtime connection mode above — it's a plain S3 action, not an RFP call) lets a tester drop
+fund-commentary files straight into the Knowledge Base's S3 docs bucket without leaving the UI or
+dropping to the CLI. A bucket-name text input plus a multi-file `st.file_uploader` feed an
+**Upload to S3** button (`s3.put_object` per file, same active AWS credentials as Runtime mode)
+and a **List documents in bucket** button (`s3.list_objects_v2`, to confirm what's actually there
+before/after). No separate ingestion step is needed afterward — the existing
+`modules/kb-ingestion-sync` auto-sync pipeline (see "Auto-sync ingestion" above) picks up the
+upload within its ~5 minute batching window.
+
+Verified live the same way as Runtime mode above: Playwright/headless Chromium confirmed the panel
+renders correctly, the bucket-name input commits on the expected Streamlit rerun, `Upload to S3`
+is correctly disabled with no file chosen, `List documents in bucket` correctly enables once a
+bucket name is entered, and there are zero browser console errors.
 
 ### Environment lifecycle: teardown and cost control
 

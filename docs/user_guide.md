@@ -292,6 +292,14 @@ Opens at `http://localhost:8501`. What's in it:
   on Ollama and a query is genuinely still running — see [Troubleshooting](#troubleshooting);
   Runtime-mode and Bedrock-backed local queries typically finish in well under a minute), and the
   mock fund reference table.
+- **Sidebar — Admin: Upload KB documents** (collapsed expander, independent of connection mode —
+  it's a plain S3 action, not an RFP call): a bucket-name field, a multi-file uploader, and
+  **Upload to S3** / **List documents in bucket** buttons that call S3 `PutObject`/
+  `ListObjectsV2` directly, using the same active AWS credentials as Runtime mode. Lets you seed
+  Knowledge Base commentary docs without leaving the UI or dropping to the CLI — no manual
+  ingestion call needed afterward, the auto-sync pipeline (see
+  [Enabling the Knowledge Base and ingesting documents](#enabling-the-knowledge-base-and-ingesting-documents-pass-2-in-full)
+  below) picks it up within its ~5 minute batching window.
 - **Main panel** — a dropdown of example queries (one per mock fund, including the SMC3
   high-risk/compliance-loop scenario), an editable question box, and a **Submit RFP** button.
 - **Result view** — an Approved/Escalated status badge, compliance-attempt count, elapsed time,
@@ -444,9 +452,18 @@ mentioned above) — useful background if your own deploy hits the same symptoms
 
 ### Enabling the Knowledge Base and ingesting documents (pass 2, in full)
 
-Pass 2 (`enable_knowledge_base = true` + apply) creates the vector index and an empty Knowledge
-Base — real document ingestion is a separate, manual step (Terraform never uploads documents or
-triggers ingestion).
+Pass 2 (`enable_knowledge_base = true` + apply) creates the vector index, an empty Knowledge
+Base, **and** an auto-sync pipeline (`modules/kb-ingestion-sync` — S3 event → SQS → Lambda →
+`start-ingestion-job`, see [`architecture.md`](architecture.md#auto-sync-ingestion-s3-events-to-bedrock-knowledge-base)
+for the design) — all as part of this same pass, no extra flag needed. That pipeline only
+*reacts* to bucket changes, though: Terraform never uploads a document itself, so **the first
+time** a document needs to exist in the Knowledge Base at all, someone still has to put it in the
+S3 docs bucket (steps 1–2 below). Once it's there, every future upload or deletion re-syncs the
+Knowledge Base automatically within a few minutes — no manual `start-ingestion-job` call needed
+for that part. Steps 3–5 below (look up the data source ID, trigger the job, poll it) are now
+**optional** — keep them for testing when you don't want to wait out the batching window, or if
+the CloudWatch alarm on the sync pipeline's DLQ (`<name_prefix>-kb-ingestion-dlq-depth`) fires and
+you want to see the state without digging through Lambda logs first.
 
 **Which vector store backs the Knowledge Base is controlled by `vector_store_backend`**
 (`environments/<env>/variables.tf`, default `"opensearch"`):
@@ -469,8 +486,11 @@ triggers ingestion).
 Document ingestion below is identical regardless of which backend is selected — it uploads to the
 same S3 docs bucket either way, and the Knowledge Base itself abstracts away whether the
 resulting vectors land in OpenSearch or S3 Vectors. Terraform only ever creates an *empty*
-Knowledge Base — nothing in Pass 2 uploads a document or triggers ingestion, so every step below
-is something you (or a script) has to do explicitly, every time you want to (re-)populate it.
+Knowledge Base and never uploads a document itself, so steps 1–2 below (getting a document into
+S3 the first time) are always manual. Steps 3–5 (looking up the data source ID, triggering the
+job, polling it) are the *initial* ingestion for that first upload — after that, the auto-sync
+pipeline handles every subsequent change on its own, so you generally only walk through the full
+five steps once per document.
 
 **(opensearch backend only) Before this pass**: add your own applier ARN to
 `additional_data_access_principals` in `terraform.tfvars` (see README's Pass 2 section), then
@@ -480,25 +500,10 @@ doesn't need this step at all.
 #### Step 1 — Get the source documents as real files
 
 The Knowledge Base's data source only ever reads from S3 — it can't ingest a Python string
-directly. The mock-fund commentary text already used to seed the local Chroma store in DEV lives
-*only* as Python string literals in `data/chroma_store.py`'s `_MOCK_COMMENTARY` list — there's no
-standalone `.txt` file for it anywhere in the repo. For a real cloud deploy you have to write each
-fund's text out to its own file first (copy the exact strings out of that list):
-
-```powershell
-mkdir kb_docs
-"Global Equity Growth Fund (EQG1): We maintain a structural overweight in mega-cap technology..." `
-  | Out-File -Encoding utf8 kb_docs\doc_eqg1.txt
-"Alpha Prime Smallcap Direct Fund (SMC3): The fund exhibits high volatility..." `
-  | Out-File -Encoding utf8 kb_docs\doc_smc3.txt
-"Fixed Income Core Bond Fund (INC2): We have actively reduced duration risk..." `
-  | Out-File -Encoding utf8 kb_docs\doc_inc2.txt
-"Balanced Conservative Wealth Fund (BLN4): A multi-asset dynamic allocation framework..." `
-  | Out-File -Encoding utf8 kb_docs\doc_bln4.txt
-```
-
-(Truncated above for readability — use the full text from `_MOCK_COMMENTARY`, not these `...`
-fragments.)
+directly. The mock-fund commentary text used to seed the local Chroma store in DEV
+(`data/chroma_store.py`'s `_MOCK_COMMENTARY` list) is already checked into the repo as standalone
+`.txt` files under [`docs/mock-data/`](mock-data/) (`doc_eqg1.txt`, `doc_smc3.txt`, `doc_inc2.txt`,
+`doc_bln4.txt`), copied verbatim from that list — nothing to generate yourself.
 
 #### Step 2 — Upload each file to the Knowledge Base's S3 docs bucket
 
@@ -507,14 +512,23 @@ output, not something you choose or hardcode:
 
 ```powershell
 $bucket = terraform output -raw kb_docs_bucket_name   # e.g. amc-orchestrator-dev-kb-docs-766354255780
-aws s3 cp kb_docs\doc_eqg1.txt s3://$bucket/doc_eqg1.txt
-aws s3 cp kb_docs\doc_smc3.txt s3://$bucket/doc_smc3.txt
-aws s3 cp kb_docs\doc_inc2.txt s3://$bucket/doc_inc2.txt
-aws s3 cp kb_docs\doc_bln4.txt s3://$bucket/doc_bln4.txt
+aws s3 cp ..\..\docs\mock-data\ s3://$bucket/ --recursive --exclude "*" --include "doc_*.txt"
 ```
 
-At this point the files exist in S3, but **the Knowledge Base has no idea they're there yet** —
-Bedrock never watches the bucket automatically. Ingestion has to be triggered explicitly (step 4).
+(Adjust the relative path if you're not running this from `infra/terraform/environments/<env>/` —
+`docs/mock-data/` is at the repo root.)
+
+Alternatively, the Streamlit UI's sidebar **Admin: Upload KB documents** panel (see
+[Running via the Streamlit UI](#running-via-the-streamlit-ui) above) does the same `PutObject`
+call per file through a browser file picker — useful if you'd rather not leave the UI.
+
+At this point the files exist in S3, and the auto-sync pipeline (`modules/kb-ingestion-sync`) has
+already queued a `start-ingestion-job` call in the background — it fires within
+`maximum_batching_window_seconds` (default 5 minutes) of the upload with no further action from
+you. If you don't want to wait, or want to see a job ID and poll it yourself right now, steps 3–5
+below trigger the exact same operation manually and immediately (harmless to run even if the
+automatic sync also fires around the same time — Bedrock just treats the second call as a
+`ConflictException`, which both paths already handle gracefully).
 
 #### Step 3 — Look up the data source ID
 
@@ -529,7 +543,7 @@ aws bedrock-agent list-data-sources --knowledge-base-id $kbId
 # copy the "dataSourceId" value from the JSON output, e.g. "5LFXDA9A5K"
 ```
 
-#### Step 4 — Trigger the ingestion job
+#### Step 4 — Trigger the ingestion job (optional — the auto-sync pipeline does this for you)
 
 This is the step that actually does the work: Bedrock reads every object currently in the S3 docs
 bucket, splits each one into chunks (per `modules/knowledge-base`'s `chunking_max_tokens`/
@@ -566,9 +580,21 @@ per-document failure reason.
 
 **Confirmed working, dev, 2026-07-12**: all 4 mock-fund commentary texts uploaded and ingested
 exactly via steps 1–5 above — `numberOfDocumentsScanned: 4, numberOfNewDocumentsIndexed: 4,
-numberOfDocumentsFailed: 0`, confirmed complete on the very first 5-second poll. See
-`CLAUDE.md`'s "Phase 02" section for the full session log, and `data/chroma_store.py`'s
-`_MOCK_COMMENTARY` for the exact source text if you're reproducing this for staging/prod.
+numberOfDocumentsFailed: 0`, confirmed complete on the very first 5-second poll (that run predates
+[`docs/mock-data/`](mock-data/) existing as checked-in files — it copy-pasted the text out of
+`data/chroma_store.py`'s `_MOCK_COMMENTARY` list by hand; both are the same source text). See
+`CLAUDE.md`'s "Phase 02" section for the full session log.
+
+**Auto-sync pipeline (`modules/kb-ingestion-sync`, added 2026-07-13) is now applied to real AWS and
+field-verified end-to-end, 2026-07-13** — the "no manual step needed after the first upload" claim
+above is confirmed real behavior now, not just intent. Verified via a full round trip with no
+manual `start-ingestion-job` call made for any of it: uploading a file triggered an ingestion job
+automatically within the batching window (`numberOfNewDocumentsIndexed: 1`), deleting that file
+triggered another job that correctly removed its vector (`numberOfDocumentsDeleted: 1`, confirmed
+absent from a subsequent `bedrock-agent-runtime retrieve` call), and re-uploading it restored the
+vector (`numberOfNewDocumentsIndexed: 1` again). Full step-by-step trace and evidence:
+[`sample_invocation_walkthrough.md`](sample_invocation_walkthrough.md)'s "S3 Auto Sync - Inner
+working" section.
 
 ### Testing the deployed AgentCore Runtime (Phase 02)
 
