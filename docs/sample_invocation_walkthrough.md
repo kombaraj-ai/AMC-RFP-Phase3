@@ -272,3 +272,149 @@ rate fluctuations and market volatility.
   retries needed - the exact failure mode documented for Ollama didn't occur here.
 - **~30-50x faster than the equivalent Ollama run** (11.64s vs. 5-10+ minutes), for the same
   query shape - the practical motivation for the DEV model-provider toggle.
+
+## S3 Auto Sync - Inner working
+
+How a document dropped into the Knowledge Base's S3 docs bucket ends up searchable by
+`qual_narrative_pull`'s `search_fund_commentary` tool, with **no manual `start_ingestion_job`
+call**. Built by `infra/terraform/modules/kb-ingestion-sync` (SQS queue + DLQ, S3 bucket
+notification, Lambda + event source mapping) plus
+`infra/terraform/modules/iam/kb_ingestion_sync_role.tf` (the Lambda's execution role) and the
+`kb_ingestion_dlq_depth` alarm in `modules/observability`. Wired into all three environments'
+root modules identically, `count = var.enable_knowledge_base ? 1 : 0` (see CLAUDE.md's Phase 02
+log, "Auto-sync RAG pipeline" entry, for the design decisions and trade-offs). Confirmed working
+live against real AWS in dev on 2026-07-13 (ingestion job `7MWH1RDDPA`, see step 8 below).
+
+Real dev resource names used throughout (from `name_prefix = "amc-orchestrator-dev"`):
+
+| Resource | Name / ID |
+|---|---|
+| Docs bucket | `amc-orchestrator-dev-kb-docs-766354255780` |
+| Events queue | `amc-orchestrator-dev-kb-ingestion-events` |
+| DLQ | `amc-orchestrator-dev-kb-ingestion-dlq` |
+| Lambda | `amc-orchestrator-dev-kb-ingestion-sync` |
+| Lambda execution role | `amc-orchestrator-dev-kb-ingestion-sync-role` |
+| Knowledge Base | `CLFXD2BCJX` |
+| Data source | `FHWNEWR1PU` (`amc-orchestrator-dev-fund-commentary-docs`) |
+
+### Step-by-step: from S3 upload to searchable document
+
+1. **User (or CI) uploads a file to the docs bucket.**
+   `aws s3 cp doc_inc2.txt s3://amc-orchestrator-dev-kb-docs-766354255780/` - or a delete of an
+   existing key. This step itself is **not** automated by Terraform; it's the one manual/CI step
+   this pipeline was built to remove all the *downstream* toil from (see
+   `data/knowledge_base_store.py`'s `ensure_seeded()` docstring, and CLAUDE.md's "Auto-sync RAG
+   pipeline" entry for why the initial upload stays manual).
+
+2. **S3 bucket notification fires synchronously on the write.**
+   `aws_s3_bucket_notification.docs` (`kb-ingestion-sync/main.tf`) is configured on the bucket for
+   `s3:ObjectCreated:*` and `s3:ObjectRemoved:*`. S3 itself (not a Lambda, not polling) publishes
+   an event describing the object key/bucket/event-type directly to SQS - this is a native S3
+   feature, no compute runs at this step.
+
+3. **The event lands in the SQS events queue.**
+   `aws_sqs_queue.events` (`amc-orchestrator-dev-kb-ingestion-events`). Delivery from S3 is only
+   possible because of `aws_sqs_queue_policy.events` - an explicit resource-based policy
+   statement (`AllowS3SendMessage`) granting the `s3.amazonaws.com` service principal
+   `sqs:SendMessage`, conditioned on `aws:SourceArn` matching this exact docs bucket's ARN (so no
+   other bucket in the account can push into this queue). `depends_on` in `main.tf` guarantees
+   this policy exists *before* the bucket notification is created, avoiding a race where S3
+   attempts delivery before permission exists.
+
+4. **The queue debounces rapid/bulk uploads instead of firing per-file.**
+   This is the deliberate core design point: Bedrock allows only **one running ingestion job per
+   data source at a time**, so triggering a Lambda invocation (and a `start_ingestion_job` call)
+   per individual S3 event would mostly just collide. Instead,
+   `aws_lambda_event_source_mapping.events` sets `batch_size = 10` and
+   `maximum_batching_window_in_seconds = 300` (5 minutes) - the mapping waits up to 5 minutes
+   (or until 10 messages accumulate, whichever comes first) before invoking the Lambda with the
+   whole batch at once. Uploading 4 files in a burst (as in the live test) still results in
+   **one** Lambda invocation and **one** ingestion job, not four.
+
+5. **The event source mapping invokes the Lambda with the batch.**
+   `amc-orchestrator-dev-kb-ingestion-sync` (Python 3.13, `sync_src/handler.py`, 256 MB, 120s
+   timeout). It runs as `amc-orchestrator-dev-kb-ingestion-sync-role`, whose only three
+   permissions (`kb_ingestion_sync_role.tf`) are: `bedrock:StartIngestionJob` (wildcarded to
+   `knowledge-base/*` account-wide - see that file's comment on why it can't be scoped to this
+   one KB's ARN without recreating an IAM↔KB module cycle), `sqs:ReceiveMessage` /
+   `sqs:DeleteMessage` / `sqs:GetQueueAttributes` scoped to the events queue's ARN by predictable
+   naming convention, and `logs:CreateLogGroup` / `CreateLogStream` / `PutLogEvents` scoped to its
+   own log group. It cannot read or write the KB's content directly, only trigger a sync of it.
+
+6. **The handler ignores the batch's actual contents and just triggers a full data-source
+   re-sync.** `handler.py` never inspects `event["Records"]` for which keys changed - it calls
+   `bedrock_agent.start_ingestion_job(knowledgeBaseId=KNOWLEDGE_BASE_ID,
+   dataSourceId=DATA_SOURCE_ID)` unconditionally. This is intentional: Bedrock's ingestion job is
+   already incremental/differential over the whole data source (it diffs against what's already
+   indexed), so a full re-sync call correctly picks up every new/changed/deleted object in the
+   batch without the Lambda needing to parse or track individual keys itself.
+
+7. **Two possible outcomes from the `start_ingestion_job` call, both handled:**
+   - **Success** (`200`, most common case): a real new `ingestionJobId` is returned and the
+     function exits cleanly - SQS deletes the batch's messages from the queue since the Lambda
+     returned without raising.
+   - **`ConflictException`** (a job is already running for this data source, e.g. two uploads in
+     quick succession outside one batching window): the handler treats this as a **success**, not
+     a failure (`{"status": "sync_already_running"}`), and still lets SQS delete the messages -
+     reasoning: the already-running job is incremental and will still pick up whatever new files
+     triggered *this* invocation, so nothing is lost by not retrying.
+   - **Any other `ClientError`** (a genuine failure - bad KB/data-source ID, throttling exhausted,
+     permissions error, etc.): the handler re-raises. The Lambda invocation fails, and because
+     this is an SQS-triggered async invocation, the **messages are not deleted** - they become
+     visible again after the queue's visibility timeout (`lambda_timeout_seconds * 6` = 720s, per
+     AWS's own SQS-Lambda sizing guidance, chosen specifically so a message can never become
+     visible again *while* an invocation using it is still in flight).
+
+8. **Genuine failures redrive to the DLQ after 3 attempts, and alarm.**
+   `aws_sqs_queue.events`' `redrive_policy` sends a message to `amc-orchestrator-dev-kb-ingestion-dlq`
+   after `maxReceiveCount = 3` failed receives. The `kb_ingestion_dlq_depth` CloudWatch alarm
+   (`modules/observability`, gated on `kb_ingestion_dlq_name != ""`) watches
+   `ApproximateNumberOfMessagesVisible` on that DLQ and fires through the shared
+   `aws_sns_topic.alarms` topic the moment even one message lands there - the alarm's own
+   description text is literally "a document sync genuinely failed after retries," to make clear
+   this is not a transient-condition alarm.
+
+9. **The document becomes retrievable once the ingestion job completes.**
+   Once `start_ingestion_job` succeeds, Bedrock itself takes over: it reads the changed
+   object(s) from the docs bucket, chunks/embeds them, and writes vectors into the configured
+   vector store - in dev, S3 Vectors (`modules/s3-vectors`'s index), not OpenSearch (see
+   CLAUDE.md's "S3 Vectors" section for why dev differs from staging/prod here). This part of the
+   pipeline is fully managed by the `aws_bedrockagent_knowledge_base` resource Terraform already
+   created in Pass 2 - the ingestion-sync module's only job was getting `start_ingestion_job`
+   *called* automatically; the actual chunk/embed/index work was never something this repo
+   implements itself. Once the job's status is `COMPLETE`, `search_fund_commentary`
+   (`tools/qual_tools.py` → `data/knowledge_base_store.py` → Bedrock's managed `Retrieve` API)
+   can find the new content on the very next query.
+
+### Live proof (2026-07-13, real AWS, no manual CLI ingestion call made)
+
+After uploading 4 mock-fund commentary `.txt` files to
+`amc-orchestrator-dev-kb-docs-766354255780`:
+
+```
+aws bedrock-agent list-ingestion-jobs \
+  --knowledge-base-id CLFXD2BCJX --data-source-id FHWNEWR1PU
+
+ingestionJobId: 7MWH1RDDPA
+status:         COMPLETE
+startedAt:      2026-07-13T13:10:17Z
+updatedAt:      2026-07-13T13:10:30Z
+statistics:
+  numberOfDocumentsScanned:        4
+  numberOfNewDocumentsIndexed:     4
+  numberOfModifiedDocumentsIndexed: 0
+  numberOfDocumentsDeleted:        0
+  numberOfDocumentsFailed:         0
+```
+
+Also confirmed at each layer, not just the end result:
+- `aws s3api get-bucket-notification-configuration` on the docs bucket showed the `QueueConfigurations`
+  entry pointing at the events queue for `ObjectCreated:*`/`ObjectRemoved:*`.
+- `aws lambda list-event-source-mappings --function-name amc-orchestrator-dev-kb-ingestion-sync`
+  showed `State: Enabled`, `BatchSize: 10`, `MaximumBatchingWindowInSeconds: 300`.
+- The events queue briefly showed `ApproximateNumberOfMessagesNotVisible: 1` (a message actively
+  being processed by the Lambda) before the ingestion job appeared - the expected sequence, not
+  inferred.
+
+No `start_ingestion_job` CLI/console call was made by a human for this run - step 5 above (the
+Lambda) made it.
