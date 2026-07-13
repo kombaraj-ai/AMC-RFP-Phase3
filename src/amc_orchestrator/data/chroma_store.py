@@ -39,7 +39,9 @@ _MOCK_COMMENTARY: list[tuple[str, str]] = [
         "doc_bln4",
         "Balanced Conservative Wealth Fund (BLN4): A multi-asset dynamic allocation "
         "framework. We recently rebalanced 5% out of cyclical equities into short-term "
-        "corporate bonds to lock in yields, stabilizing our Sharpe ratio near 1.05.",
+        "corporate bonds to lock in yields, stabilizing our Sharpe ratio near 1.05. "
+        "Downside protection is reinforced by a Sortino Ratio of 1.25 and a below-market "
+        "Beta of 0.75, cushioning the portfolio during equity market drawdowns.",
     ),
 ]
 
