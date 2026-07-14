@@ -177,6 +177,11 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy",
       "s3:GetBucketVersioning", "s3:PutBucketVersioning",
       "s3:GetBucketTagging", "s3:PutBucketTagging",
+      # Read-only - this project never declares an aws_s3_bucket_cors_configuration,
+      # but the provider's aws_s3_bucket resource reads cors_rule as a computed
+      # attribute on every refresh regardless, and 403s without this (found via
+      # a real deploy-role-scoped apply, 2026-07-14).
+      "s3:GetBucketCORS",
       "s3:ForceDeleteBucket",
     ]
     resources = [
@@ -299,6 +304,24 @@ data "aws_iam_policy_document" "deploy_permissions" {
     ]
   }
 
+  # The Gateway provisions its OAuth credential dependency against the
+  # account's single, shared workload-identity-directory/default resource -
+  # not an environment-scoped resource the way runtime/gateway/memory above
+  # are, so all three environments' deploy roles need this identically
+  # (missing entirely before this fix - found via a real deploy-role-scoped
+  # apply, 2026-07-14, "not authorized to perform:
+  # bedrock-agentcore:CreateWorkloadIdentity").
+  statement {
+    sid    = "AgentCoreWorkloadIdentity"
+    effect = "Allow"
+    actions = [
+      "bedrock-agentcore:CreateWorkloadIdentity", "bedrock-agentcore:GetWorkloadIdentity",
+      "bedrock-agentcore:UpdateWorkloadIdentity", "bedrock-agentcore:DeleteWorkloadIdentity",
+      "bedrock-agentcore:ListWorkloadIdentities",
+    ]
+    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default"]
+  }
+
   statement {
     sid    = "Lambda"
     effect = "Allow"
@@ -339,7 +362,7 @@ data "aws_iam_policy_document" "deploy_permissions" {
     sid    = "CloudWatchLogGroups"
     effect = "Allow"
     actions = [
-      "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy", "logs:DescribeLogGroups",
+      "logs:CreateLogGroup", "logs:DeleteLogGroup", "logs:PutRetentionPolicy",
       "logs:TagResource", "logs:UntagResource", "logs:ListTagsForResource",
       "logs:TagLogGroup", "logs:UntagLogGroup", # legacy-API equivalents some provider versions still call
     ]
@@ -347,6 +370,20 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/aws/lambda/${var.project}-${each.key}-*",
       "arn:aws:logs:${var.aws_region}:${local.account_id}:log-group:/amc-orchestrator/${var.project}-${each.key}/*",
     ]
+  }
+
+  # logs:DescribeLogGroups doesn't support resource-level scoping the way the
+  # actions above do - Terraform's provider always calls it as an account-wide
+  # list (no exact log-group name), which AWS resolves against a generic
+  # "log-group::log-stream:" ARN rather than any real log group's ARN, so it
+  # only ever matches Resource = "*" (found via a real deploy-role-scoped
+  # apply, 2026-07-14 - every prior apply used broader human credentials and
+  # never exercised this).
+  statement {
+    sid       = "CloudWatchLogsDescribeLogGroups"
+    effect    = "Allow"
+    actions   = ["logs:DescribeLogGroups"]
+    resources = ["*"]
   }
 
   statement {
