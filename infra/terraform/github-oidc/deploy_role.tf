@@ -356,6 +356,12 @@ data "aws_iam_policy_document" "deploy_permissions" {
       # via this action, regardless of whether publish = true is set (found
       # via a real deploy-role-scoped apply, 2026-07-14).
       "lambda:ListVersionsByFunction",
+      # Also called unconditionally by Read for Zip-package-type functions in
+      # commercial partitions (this project's case) - confirmed against the
+      # provider's actual v6.54.0 source rather than waiting for a 4th
+      # separate CI round-trip to discover it (found via a real
+      # deploy-role-scoped apply, 2026-07-14).
+      "lambda:GetFunctionCodeSigningConfig",
     ]
     resources = ["arn:aws:lambda:${var.aws_region}:${local.account_id}:function:${var.project}-${each.key}-*"]
   }
