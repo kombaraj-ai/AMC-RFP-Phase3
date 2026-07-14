@@ -303,6 +303,16 @@ data "aws_iam_policy_document" "deploy_permissions" {
     actions = [
       "bedrock-agentcore:CreateAgentRuntime", "bedrock-agentcore:DeleteAgentRuntime",
       "bedrock-agentcore:GetAgentRuntime", "bedrock-agentcore:UpdateAgentRuntime", "bedrock-agentcore:ListAgentRuntimes",
+      # CreateAgentRuntime implicitly provisions a default runtime endpoint
+      # too - found via a real deploy-role-scoped apply, 2026-07-14, missing
+      # entirely before this fix. Endpoints are sub-resources under a
+      # runtime (runtime/<id>/runtime-endpoint/<name>), already covered by
+      # the runtime/* wildcard below (unlike the un-wildcarded
+      # workload-identity-directory ARN fixed earlier), so only the action
+      # names needed adding here.
+      "bedrock-agentcore:CreateAgentRuntimeEndpoint", "bedrock-agentcore:DeleteAgentRuntimeEndpoint",
+      "bedrock-agentcore:GetAgentRuntimeEndpoint", "bedrock-agentcore:UpdateAgentRuntimeEndpoint",
+      "bedrock-agentcore:ListAgentRuntimeEndpoints",
       "bedrock-agentcore:CreateGateway", "bedrock-agentcore:DeleteGateway",
       "bedrock-agentcore:GetGateway", "bedrock-agentcore:UpdateGateway",
       "bedrock-agentcore:CreateGatewayTarget", "bedrock-agentcore:DeleteGatewayTarget",
@@ -376,6 +386,10 @@ data "aws_iam_policy_document" "deploy_permissions" {
     actions = [
       "lambda:CreateEventSourceMapping", "lambda:DeleteEventSourceMapping",
       "lambda:GetEventSourceMapping", "lambda:UpdateEventSourceMapping", "lambda:ListEventSourceMappings",
+      # The mapping resource is tagged like everything else this project
+      # creates - missing entirely before this fix (found via a real
+      # deploy-role-scoped apply, 2026-07-14).
+      "lambda:TagResource", "lambda:UntagResource", "lambda:ListTags",
     ]
     resources = ["*"]
   }
