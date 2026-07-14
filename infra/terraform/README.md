@@ -174,11 +174,17 @@ underlying operations, just automated. Full setup steps and the
   comment (a read-only OIDC role) for infra changes, and a Docker build
   sanity check (no push). Never applies, never pushes an image.
 - **`.github/workflows/deploy.yml`** - `workflow_dispatch` only, the *only*
-  workflow that ever mutates AWS. Builds+pushes a fresh image to dev's ECR
-  repo (dev target), promotes an already-built image into staging's/prod's
-  ECR repo via `crane copy` with no rebuild (staging/prod targets, "build
-  once, promote" - the same image is byte-identical everywhere it runs),
-  then runs `terraform apply -var="container_image_uri=..."` for whichever
+  workflow that ever mutates AWS. Runs `terraform apply -target=module.ecr`
+  first (idempotent - a no-op once the ECR repo exists) so a cold
+  environment's repo is created by Terraform before anything tries to
+  push/promote into it - found necessary the hard way when dev was
+  actually redeployed from zero resources for the first time via this
+  workflow (see root `CLAUDE.md`'s Phase 03 history). Then builds+pushes a
+  fresh image to dev's ECR repo (dev target), promotes an already-built
+  image into staging's/prod's ECR repo via `crane copy` with no rebuild
+  (staging/prod targets, "build once, promote" - the same image is
+  byte-identical everywhere it runs), then runs
+  `terraform apply -var="container_image_uri=..."` for whichever
   environment was selected. `container_image_uri` is always supplied this
   way, never committed to tracked `terraform.tfvars` (see `infra/terraform/github-oidc/`'s
   design for why).

@@ -682,7 +682,16 @@ since CI can't create the very role it needs in order to authenticate at all.
   specifically (never wildcarded), required for the promotion step below. A few S3 Vectors/
   AgentCore action names are flagged as best-effort/unverified against a live apply, the same
   honest-uncertainty pattern this project already uses for `S3VectorsDataPlane`'s real incident —
-  expect to add a missing action if a real apply through this role surfaces one.
+  expect to add a missing action if a real apply through this role surfaces one. Each `deploy-<env>`
+  role's permissions are split across **three customer-managed policies** (core infra / AgentCore+AI
+  / compute+messaging), attached via `aws_iam_role_policy_attachment`, not one combined inline
+  policy — a real incident found this the hard way (see root `CLAUDE.md`'s Phase 03 history):
+  AWS's 10,240-byte inline-policy limit is an *aggregate* across all inline policies on a role, not
+  per-document, so a first attempt at a 2-way inline split still blew through it once both documents
+  co-existed on one role, leaving one environment's deploy role with no policy attached at all.
+  Managed policies carry their own separate 6,144-byte limit that applies *per policy*, and a role
+  can attach up to 10 by default — real headroom for the next round of real-apply-driven fixes,
+  which this project has needed more than once already.
 
 ### `pr-validate.yml` — automatic, never mutates AWS
 
@@ -698,7 +707,15 @@ on every PR, including from a contributor whose intentions haven't been vetted.
 
 ### `deploy.yml` — manual only, the only workflow that mutates AWS
 
-`workflow_dispatch`-only, three jobs. `build-and-push` (dev target only) builds fresh from source
+`workflow_dispatch`-only, four jobs. `ensure-ecr` runs first for every dispatch —
+`terraform apply -target=module.ecr`, idempotent — so a cold environment (zero Terraform state)
+has its ECR repo created by Terraform itself before anything tries to push or promote into it.
+This exists because `build-and-push`/`promote` otherwise run *before* `terraform-apply` would
+normally create that repo, which only surfaced as a real bug once dev was actually torn down to
+zero resources and redeployed via CI for the first time (see root `CLAUDE.md`'s Phase 03 history) —
+deliberately a targeted `terraform apply`, not a raw `aws ecr create-repository` call, since an
+out-of-band-created repo would make the next full apply fail with "already exists" against a
+resource Terraform doesn't know about. `build-and-push` (dev target only) builds fresh from source
 and tags with the full git commit SHA — the only place `docker build` ever runs. `promote`
 (staging/prod targets) copies that exact already-built image into the target environment's own ECR
 repo via `crane copy` rather than rebuilding — a registry-to-registry copy by manifest digest, no

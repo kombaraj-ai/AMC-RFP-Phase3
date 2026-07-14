@@ -1146,26 +1146,214 @@ take effect whenever dev is next deployed from scratch.
 read the repo URL) is also untracked - safe to delete, not needed by the
 project.
 
+### GitHub Environments + first real `deploy.yml` dev rollout, 2026-07-14 (same session, continued)
+
+Steps 2-3 of `docs/ci_cd_runbook.md` (the three GitHub Environments,
+`AWS_PLAN_ROLE_ARN`/`TF_STATE_BUCKET` repo variables, per-Environment
+`AWS_DEPLOY_ROLE_ARN`) were completed manually via the GitHub web UI (no
+`gh` CLI available in this dev environment, confirmed absent in both bash
+and PowerShell). User then dispatched `deploy.yml` for `environment=dev`
+repeatedly to redeploy the torn-down environment from scratch - this
+surfaced a real, never-before-exercised ordering bug plus **seven rounds**
+of real IAM gaps in the `deploy-dev` role, each found via an actual failed
+CI-scoped apply, not guessed. Every fix was applied directly to
+`infra/terraform/github-oidc` (a local `terraform apply`, since that module
+is the one piece of CI infra that bootstraps itself) and pushed to `main`
+before the next dispatch. This is the single most valuable real-world
+lesson from Phase 03: **every prior `environments/dev` apply in this
+project's history ran under the user's own broad `eks-admin` credentials,
+never the actual least-privilege `deploy-<env>` role Terraform itself
+creates for CI** - so this was the first time that role's real permissions
+were ever exercised end-to-end, and it needed real hardening, not just a
+plan-time check.
+
+**Bug found and fixed first, `.github/workflows/deploy.yml`**: `build-and-push`
+(dev) and `promote` (staging/prod) both ran *before* `terraform-apply`,
+which normally creates the ECR repo - fine as long as the environment
+already had one from a prior apply (true every time before this session),
+but dev was genuinely torn down to zero resources, so the very first
+dispatch failed pushing to a repo that didn't exist yet. Fixed with a new
+`ensure-ecr` job (`terraform apply -target=module.ecr` first, on every
+dispatch - idempotent, so it's a no-op once the repo exists) that
+`build-and-push`/`promote`/`terraform-apply` all now depend on correctly.
+**Explicitly Terraform-only, not a raw `aws ecr create-repository` call**
+per the user's own stated preference - see the standing feedback memory on
+this - since an out-of-band-created resource would make the next full
+apply fail with "already exists" against a repo Terraform doesn't know
+about.
+
+**Seven rounds of real IAM gaps found and fixed, in the order they
+surfaced** (each confirmed via `terraform plan`/`apply` against the real
+`github-oidc` state after the fix, before the next dispatch):
+
+1. `bedrock-agentcore:CreateWorkloadIdentity` missing entirely (the Gateway
+   needs it against the account's singleton `workload-identity-directory/default`).
+2. `logs:DescribeLogGroups` granted but scoped to name-prefixed ARNs - AWS
+   always resolves this specific action to a generic `log-group::log-stream:`
+   ARN that only matches `Resource = "*"`, a real AWS quirk, not an
+   oversight in the original scoping.
+3. `s3:GetBucketCORS` missing - `aws_s3_bucket`'s Read function
+   unconditionally calls several `Get*` sub-config APIs on every refresh
+   regardless of whether this project declares the corresponding block.
+   Rather than keep discovering these one at a time, read the actual
+   installed `terraform-provider-aws` v6.54.0 source
+   (`resourceBucketRead` in `internal/service/s3/bucket.go`, fetched live)
+   and pre-empted the rest: `GetBucketWebsite`, `GetAccelerateConfiguration`,
+   `GetBucketRequestPayment`, `GetBucketLogging`, `GetReplicationConfiguration`,
+   `GetBucketObjectLockConfiguration` - action names verified against AWS's
+   own IAM policy-generator dataset
+   (`awspolicygen.s3.amazonaws.com/js/policies.js`), not guessed (several
+   deliberately omit "Bucket", matching the project's own precedent for
+   `GetLifecycleConfiguration`/`GetEncryptionConfiguration`).
+4. The workload-identity fix from round 1 still 403'd on a second real
+   apply - AWS actually authorizes `CreateWorkloadIdentity` against the
+   *sub-resource being created*
+   (`.../workload-identity-directory/default/workload-identity/<id>`), not
+   the bare directory ARN the first attempt granted. Same apply also
+   needed `lambda:ListVersionsByFunction` (`aws_lambda_function`'s Read
+   always checks the latest published version).
+5. `lambda:GetFunctionCodeSigningConfig` - also read the provider's actual
+   `function.go` source this time rather than waiting for a further
+   round-trip; confirmed it's the only other unconditional call for
+   Zip-package-type functions in commercial partitions (this project's
+   case).
+6. `CreateAgentRuntime` implicitly provisions a default runtime endpoint
+   too (`bedrock-agentcore:CreateAgentRuntimeEndpoint` + Get/Update/Delete/List
+   siblings, missing entirely - already covered by the existing `runtime/*`
+   wildcard, unlike round 1's un-wildcarded ARN). Same apply needed
+   `lambda:TagResource`/`UntagResource`/`ListTags` on the
+   `LambdaEventSourceMappings` statement (the kb-ingestion-sync event
+   source mapping is tagged like everything else this project creates).
+7. `CreateAgentRuntime` also auto-creates *and tags* its own workload
+   identity - `bedrock-agentcore:TagResource`/`UntagResource`/`ListTagsForResource`
+   were missing from the `AgentCoreWorkloadIdentity` statement specifically
+   (the `AgentCoreRuntimeGatewayMemory` statement's own `TagResource` grant
+   doesn't apply, since its `resources` list is runtime/gateway/memory
+   ARNs, not workload-identity ones).
+
+**A real incident, not just a plan-time gap, surfaced fixing round 7**:
+adding those three tag actions pushed the combined inline policy over
+AWS's real `LimitExceeded: Maximum policy size of 10240 bytes exceeded`. A
+first fix attempt split the one inline policy into two smaller
+`aws_iam_role_policy` resources - **this did not work**, because AWS's
+10,240-byte inline-policy limit is an **aggregate across all inline
+policies on a single role**, not per-document (confirmed against AWS's own
+IAM quotas reference page, fetched live - "the total aggregate policy
+size... per entity can't exceed" 10,240 bytes). The partial apply that
+resulted left real broken state: dev happened to fit under the aggregate
+by luck, staging ended up with only one of its two new inline policies
+attached, and **prod ended up with neither** - confirmed directly via
+`aws iam list-role-policies`/`list-attached-role-policies` before fixing,
+not assumed. **Properly fixed** by switching to customer-managed policies
+(`aws_iam_policy` + `aws_iam_role_policy_attachment`, three-way split by
+service area: core / agentcore+AI / compute+messaging) - managed policies
+have their own separate 6,144-byte limit that applies *per policy*, not
+aggregated, and a role can attach up to 10 by default, giving real
+headroom (largest split policy ended up ~4.3KB) for whatever the next
+round of real-apply-driven fixes turns out to be. Re-verified via
+`aws iam list-attached-role-policies` on all three roles after the fix -
+each has exactly its three managed policies, zero leftover inline ones.
+This whole incident is saved as a standing project memory (aggregate vs.
+per-document inline-policy quota) since it's exactly the kind of
+non-obvious AWS behavior likely to bite again on any role expected to grow
+over time.
+
+**Full live verification, once the fixes landed** (not just "CI went
+green" - the same "verify against real AWS, not just Terraform" discipline
+this project has followed since Phase 02):
+- `terraform state list` (dev): all 49 expected resources present.
+- `terraform plan` against dev with the real applied `container_image_uri`:
+  zero real drift (one benign `archive_file` zip-hash quirk on the two
+  Lambda stubs - a known timestamp-in-zip artifact, not a config problem).
+- Real AWS status checks via `boto3`: Agent Runtime `READY`, Gateway
+  `READY`.
+- Live `invoke_agent_runtime` call (INC2 query): `graph_status=completed`,
+  built from the exact latest-pushed commit (confirmed by reading the
+  applied `container_uri` back out of state and matching it to the git
+  SHA).
+- **A real finding along the way**: that first live invocation returned a
+  confident, specific "Manager Strategy Commentary" section - but the
+  Knowledge Base's `Retrieve` API (checked directly) returned **zero
+  results**, since dev's S3 docs bucket was still empty from the teardown.
+  The `qual_narrative_pull` agent's own system prompt explicitly says
+  *"never invent strategic positions... if no relevant commentary is
+  found, state that plainly"* - it fabricated anyway, and the compliance
+  judge approved the fabrication rather than catching it or escalating.
+  **This is a real, reproduced compliance-integrity gap, distinct from the
+  infra work, and is not yet fixed** - flagged as the next thing to
+  investigate (see below), not chased further this session given the
+  immediate goal was confirming the deployment itself.
+- Re-uploaded the same 4 mock-fund commentary `.txt` files to the S3 docs
+  bucket (`chroma_store.py`'s `_MOCK_COMMENTARY`, same texts as every prior
+  session) - confirmed the `kb-ingestion-sync` auto-sync pipeline fires for
+  real on a plain `aws s3 cp` (polled `list-ingestion-jobs` until a fresh
+  job appeared, debounced by the pipeline's 5-minute batching window as
+  designed - `4 scanned, 4 indexed, 0 failed`). Direct `Retrieve` call
+  confirmed real grounded content this time, textually matching the
+  uploaded doc. A repeat `invoke_agent_runtime` call this same round
+  actually **escalated** (`compliance_attempts=3, escalated=true`) rather
+  than reaching `APPROVED` - a well-formed graceful outcome per the
+  system's resilience contract, not a crash, but also not the clean
+  `APPROVED` result the same query has reliably gotten in prior sessions
+  on Bedrock/Nova. Not yet investigated further - flagged as a second open
+  question alongside the fabrication finding, both likely worth a session
+  looking at `agents/compliance_agent.py` and the `qual_agent.py` prompt
+  together, since they may be related (a judge that can't reliably catch
+  fabrication may also be inconsistent about what it approves).
+- **Streamlit UI, live-browser-verified against the real deployed Runtime**
+  (Playwright driving headless Chromium, installed standalone into the
+  scratchpad - no `chromium-cli` in this environment, same precedent as
+  the original Phase 02 UI verification): switched Target to "Deployed
+  AgentCore Runtime (AWS)", entered the real runtime ARN, got a genuine
+  **"✅ Runtime READY"** badge (a live `get_agent_runtime` call, not
+  cached), submitted the INC2 example query through the actual form, and
+  got a real rendered result - **✅ Approved, Compliance attempts: 2,
+  15.2s, Graph status: completed** - with the manager commentary now
+  matching the freshly-ingested document verbatim. Zero console errors.
+  This is the first time this specific UI flow was verified against a
+  *freshly redeployed* Runtime (a new ARN each redeploy), not just the one
+  from the original Phase 02 session.
+
+**Dev torn down again, deliberately, 2026-07-14 (end of session)**: user
+requested a full teardown back to zero cost/footprint once verification
+was complete. Scope confirmed explicitly: `environments/dev` only (49
+resources) - `github-oidc` and `bootstrap` left untouched, staging/prod
+already had nothing. `force_delete`/`force_destroy` flags already baked
+into `modules/ecr`/`modules/s3-kb-docs`/`modules/s3-vectors` from the
+Phase 02 teardown incident meant a `terraform plan -destroy` dry-run came
+back clean (`0 to add, 0 to change, 49 to destroy`, no errors) before the
+real `terraform destroy` - unlike Phase 02's teardown, this one went
+clean on the first try, no manual AWS-API workarounds needed. Verified
+directly against AWS afterward, not just `terraform state list`:
+`aws ecr describe-repositories` → `RepositoryNotFoundException`,
+`aws s3api head-bucket` → `404 Not Found`.
+
 ### Immediate next step (resume here)
 
-1. **Decide how to handle dev's teardown** (see finding above) - most
-   likely a fresh 3-pass dev redeploy (pass 1 infra → pass 2
-   `enable_knowledge_base=true` + document ingestion → pass 3
-   `enable_agent_runtime=true` + fresh `docker build`/`push`), which would
-   also be the natural moment to verify the new `deploy-dev` role ARN
-   addition lands correctly. Alternative: leave dev down and let the first
-   `deploy.yml` dispatch (step 4 below) be the one to redeploy it, once CI
-   is wired up - a good real test of the pipeline, but means step 4 is a
-   bigger first test than originally planned (full fresh deploy, not an
-   incremental update).
-2. `docs/ci_cd_runbook.md` steps 2-3: create the three GitHub Environments
-   (`dev`/`staging`/`prod`, restrict deployment branches to `main`), set
-   the repo-level variables (`AWS_PLAN_ROLE_ARN` = the `plan_role_arn`
-   above, `TF_STATE_BUCKET` = `amc-orchestrator-tfstate-766354255780`) and
-   the per-Environment `AWS_DEPLOY_ROLE_ARN` (the matching `deploy_role_arns`
-   entry above, one per Environment).
-3. Dispatch `deploy.yml` for `dev` first (lowest risk - though see item 1,
-   it's now a from-scratch deploy not an incremental one) as the first
-   real end-to-end proof the pipeline works, before attempting staging/prod's
-   first-ever rollout (`docs/ci_cd_runbook.md`
-   section 4).
+1. **Dev is fully torn down again** (deliberately, this time - see above).
+   A fresh 3-pass redeploy is required before any further dev-environment
+   work - either the familiar local sequence, or a single `deploy.yml`
+   dispatch for `environment=dev` (now proven to work cold-start,
+   including the `ensure-ecr` fix, all 7 rounds of IAM fixes, and the
+   managed-policy restructure - a from-scratch redeploy should go clean on
+   the first dispatch now, not take 8 rounds like this session did).
+2. **Two open, real findings from this session, not yet investigated**:
+   - The qual agent fabricates fund commentary when the Knowledge Base
+     legitimately has zero results, instead of honestly reporting "not
+     found" per its own system prompt - and the compliance judge approved
+     it. Look at `agents/qual_agent.py`'s prompt adherence and
+     `agents/compliance_agent.py`'s judging criteria together.
+   - A real, grounded INC2 query (KB populated, real retrieval confirmed)
+     escalated after 3 compliance attempts instead of reaching `APPROVED`,
+     where the same query has reliably passed in 1-2 attempts in every
+     prior session on Bedrock/Nova. Possibly related to the fabrication
+     finding (a judge inconsistent about what counts as compliant), worth
+     investigating together rather than as two unrelated flukes.
+3. Staging/prod first-ever rollout (`docs/ci_cd_runbook.md` section 4) -
+   still not started. Their tfvars already have the EOL-Claude-model fix
+   from earlier this phase; they'll need the same `deploy-<env>` role ARN
+   wired into `additional_data_access_principals` (placeholder comments
+   already mark where) once their own pass 2 lands, mirroring dev's
+   pattern.
+4. The deliberately-deferred Gateway-routed tools / AgentCore Memory graph
+   integration (unchanged from earlier in this phase).
