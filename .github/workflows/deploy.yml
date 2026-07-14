@@ -43,8 +43,54 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
+  # A cold environment (zero Terraform state - e.g. dev after a full
+  # teardown) has no ECR repo yet, but build-and-push/promote need one to
+  # push/copy into *before* the main terraform-apply job would otherwise
+  # create it. Applying module.ecr on its own first - via Terraform, not a
+  # raw `aws ecr create-repository` - avoids a later state conflict (the
+  # full apply would fail with "repository already exists" against a repo
+  # Terraform doesn't know about). Idempotent/no-op whenever the repo
+  # already exists, so this is safe to run on every dispatch, not just a
+  # true first-ever one.
+  ensure-ecr:
+    name: Ensure ECR repository exists (${{ inputs.environment }})
+    if: inputs.environment == 'dev' || inputs.promote_image
+    runs-on: ubuntu-latest
+    environment: ${{ inputs.environment }}
+    permissions:
+      id-token: write
+      contents: read
+    defaults:
+      run:
+        working-directory: infra/terraform/environments/${{ inputs.environment }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: "1.15.7"
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Write backend.hcl
+        run: |
+          cat > backend.hcl <<EOF
+          bucket = "${{ vars.TF_STATE_BUCKET }}"
+          key    = "${{ inputs.environment }}/terraform.tfstate"
+          region = "${{ env.AWS_REGION }}"
+          EOF
+
+      - run: terraform init -backend-config=backend.hcl
+
+      - name: terraform apply -target=module.ecr
+        run: terraform apply -auto-approve -target=module.ecr
+
   build-and-push:
     name: Build & push (dev)
+    needs: [ensure-ecr]
     if: inputs.environment == 'dev'
     runs-on: ubuntu-latest
     environment: dev
@@ -84,6 +130,7 @@ jobs:
 
   promote:
     name: Promote image (${{ inputs.environment }})
+    needs: [ensure-ecr]
     if: inputs.environment != 'dev' && inputs.promote_image
     runs-on: ubuntu-latest
     environment: ${{ inputs.environment }}
@@ -129,9 +176,10 @@ jobs:
 
   terraform-apply:
     name: terraform apply (${{ inputs.environment }})
-    needs: [build-and-push, promote]
+    needs: [ensure-ecr, build-and-push, promote]
     if: |
       always() &&
+      (needs.ensure-ecr.result == 'success' || needs.ensure-ecr.result == 'skipped') &&
       (needs.build-and-push.result == 'success' || needs.build-and-push.result == 'skipped') &&
       (needs.promote.result == 'success' || needs.promote.result == 'skipped')
     runs-on: ubuntu-latest
