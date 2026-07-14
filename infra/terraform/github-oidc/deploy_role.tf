@@ -69,7 +69,23 @@ resource "aws_iam_role" "deploy" {
   tags               = local.common_tags
 }
 
-data "aws_iam_policy_document" "deploy_permissions" {
+# Split into three documents (core infra / AgentCore+AI / compute+messaging)
+# and attached as customer-managed policies rather than inline ones -
+# discovered the hard way, 2026-07-14: AWS's 10,240-byte inline-policy limit
+# is an AGGREGATE across ALL inline policies on a single role, not a
+# per-document limit (confirmed against AWS's own IAM quotas doc - "the
+# total aggregate policy size... per entity can't exceed" 10,240 bytes). A
+# first attempt at a 2-way inline split still exceeded that aggregate once
+# both documents co-existed on one role (this actually left dev fitting by
+# luck, staging partially applied, and prod with NEITHER policy attached -
+# a real broken-role incident, not just a plan-time problem). Customer
+# managed policies have their own separate 6,144-byte limit that applies
+# PER POLICY, not aggregated, and a role can attach up to 10 by default -
+# so a 3-way split here has real headroom for the next several rounds of
+# real-apply-driven fixes, unlike another inline split would have. No
+# permissions or scoping logic changed by this restructure, just how each
+# statement's JSON is packaged and attached.
+data "aws_iam_policy_document" "deploy_permissions_core" {
   for_each = toset(local.environments)
 
   statement {
@@ -227,6 +243,35 @@ data "aws_iam_policy_document" "deploy_permissions" {
     }
   }
 
+  # KMS CMKs - only actually created when this environment's use_cmk = true
+  # (staging/prod, see environments/*/terraform.tfvars). kms:CreateKey has
+  # no resource to scope to before the key exists, an AWS-imposed
+  # constraint; the alias IS name-prefixable and scoped accordingly.
+  statement {
+    sid       = "KmsCreateKey"
+    effect    = "Allow"
+    actions   = ["kms:CreateKey"]
+    resources = ["*"]
+  }
+
+  statement {
+    sid    = "KmsManageOwnKeys"
+    effect = "Allow"
+    actions = [
+      "kms:DescribeKey", "kms:EnableKeyRotation", "kms:PutKeyPolicy", "kms:ScheduleKeyDeletion",
+      "kms:TagResource", "kms:UntagResource", "kms:ListResourceTags",
+      "kms:CreateAlias", "kms:DeleteAlias", "kms:UpdateAlias",
+    ]
+    resources = [
+      "arn:aws:kms:${var.aws_region}:${local.account_id}:key/*",
+      "arn:aws:kms:${var.aws_region}:${local.account_id}:alias/${var.project}-${each.key}-*",
+    ]
+  }
+}
+
+data "aws_iam_policy_document" "deploy_permissions_agentcore" {
+  for_each = toset(local.environments)
+
   # OpenSearch Serverless control plane (collection + security/access
   # policies). Most aoss control-plane actions don't support resource-level
   # ARN scoping at all (per AWS's own Service Authorization Reference for
@@ -347,12 +392,23 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "bedrock-agentcore:CreateWorkloadIdentity", "bedrock-agentcore:GetWorkloadIdentity",
       "bedrock-agentcore:UpdateWorkloadIdentity", "bedrock-agentcore:DeleteWorkloadIdentity",
       "bedrock-agentcore:ListWorkloadIdentities",
+      # CreateAgentRuntime auto-creates and tags a workload identity for
+      # itself - missing entirely before this fix (found via a real
+      # deploy-role-scoped apply, 2026-07-14). The
+      # AgentCoreRuntimeGatewayMemory statement's TagResource grant doesn't
+      # apply here since its resources list is runtime/gateway/memory ARNs,
+      # not workload-identity ones.
+      "bedrock-agentcore:TagResource", "bedrock-agentcore:UntagResource", "bedrock-agentcore:ListTagsForResource",
     ]
     resources = [
       "arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default",
       "arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default/workload-identity/*",
     ]
   }
+}
+
+data "aws_iam_policy_document" "deploy_permissions_compute" {
+  for_each = toset(local.environments)
 
   statement {
     sid    = "Lambda"
@@ -456,37 +512,49 @@ data "aws_iam_policy_document" "deploy_permissions" {
     ]
     resources = ["arn:aws:sns:${var.aws_region}:${local.account_id}:${var.project}-${each.key}-*"]
   }
-
-  # KMS CMKs - only actually created when this environment's use_cmk = true
-  # (staging/prod, see environments/*/terraform.tfvars). kms:CreateKey has
-  # no resource to scope to before the key exists, an AWS-imposed
-  # constraint; the alias IS name-prefixable and scoped accordingly.
-  statement {
-    sid       = "KmsCreateKey"
-    effect    = "Allow"
-    actions   = ["kms:CreateKey"]
-    resources = ["*"]
-  }
-
-  statement {
-    sid    = "KmsManageOwnKeys"
-    effect = "Allow"
-    actions = [
-      "kms:DescribeKey", "kms:EnableKeyRotation", "kms:PutKeyPolicy", "kms:ScheduleKeyDeletion",
-      "kms:TagResource", "kms:UntagResource", "kms:ListResourceTags",
-      "kms:CreateAlias", "kms:DeleteAlias", "kms:UpdateAlias",
-    ]
-    resources = [
-      "arn:aws:kms:${var.aws_region}:${local.account_id}:key/*",
-      "arn:aws:kms:${var.aws_region}:${local.account_id}:alias/${var.project}-${each.key}-*",
-    ]
-  }
 }
 
-resource "aws_iam_role_policy" "deploy" {
+resource "aws_iam_policy" "deploy_core" {
   for_each = toset(local.environments)
 
-  name   = "${var.project}-${each.key}-gha-deploy-policy"
-  role   = aws_iam_role.deploy[each.key].id
-  policy = data.aws_iam_policy_document.deploy_permissions[each.key].json
+  name   = "${var.project}-${each.key}-gha-deploy-core-policy"
+  policy = data.aws_iam_policy_document.deploy_permissions_core[each.key].json
+  tags   = local.common_tags
+}
+
+resource "aws_iam_policy" "deploy_agentcore" {
+  for_each = toset(local.environments)
+
+  name   = "${var.project}-${each.key}-gha-deploy-agentcore-policy"
+  policy = data.aws_iam_policy_document.deploy_permissions_agentcore[each.key].json
+  tags   = local.common_tags
+}
+
+resource "aws_iam_policy" "deploy_compute" {
+  for_each = toset(local.environments)
+
+  name   = "${var.project}-${each.key}-gha-deploy-compute-policy"
+  policy = data.aws_iam_policy_document.deploy_permissions_compute[each.key].json
+  tags   = local.common_tags
+}
+
+resource "aws_iam_role_policy_attachment" "deploy_core" {
+  for_each = toset(local.environments)
+
+  role       = aws_iam_role.deploy[each.key].name
+  policy_arn = aws_iam_policy.deploy_core[each.key].arn
+}
+
+resource "aws_iam_role_policy_attachment" "deploy_agentcore" {
+  for_each = toset(local.environments)
+
+  role       = aws_iam_role.deploy[each.key].name
+  policy_arn = aws_iam_policy.deploy_agentcore[each.key].arn
+}
+
+resource "aws_iam_role_policy_attachment" "deploy_compute" {
+  for_each = toset(local.environments)
+
+  role       = aws_iam_role.deploy[each.key].name
+  policy_arn = aws_iam_policy.deploy_compute[each.key].arn
 }
