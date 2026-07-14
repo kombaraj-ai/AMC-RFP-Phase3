@@ -177,11 +177,25 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "s3:GetBucketPolicy", "s3:PutBucketPolicy", "s3:DeleteBucketPolicy",
       "s3:GetBucketVersioning", "s3:PutBucketVersioning",
       "s3:GetBucketTagging", "s3:PutBucketTagging",
-      # Read-only - this project never declares an aws_s3_bucket_cors_configuration,
-      # but the provider's aws_s3_bucket resource reads cors_rule as a computed
-      # attribute on every refresh regardless, and 403s without this (found via
-      # a real deploy-role-scoped apply, 2026-07-14).
+      # Read-only - aws_s3_bucket's Read function (resourceBucketRead in the
+      # provider source) unconditionally calls all of these sub-config Get*
+      # APIs on every refresh, regardless of whether this project declares
+      # the corresponding block/sub-resource. GetBucketCORS was found first
+      # via a real deploy-role-scoped apply (2026-07-14); the rest were
+      # pre-empted by reading the provider's actual v6.54.0 source instead of
+      # waiting to hit each one across a separate slow CI run. Names verified
+      # against AWS's own IAM policy-generator action list, not guessed -
+      # several (GetAccelerateConfiguration, GetReplicationConfiguration)
+      # deliberately omit "Bucket" unlike their API operation name, matching
+      # the same already-correct pattern as GetLifecycleConfiguration/
+      # GetEncryptionConfiguration above.
       "s3:GetBucketCORS",
+      "s3:GetBucketWebsite",
+      "s3:GetAccelerateConfiguration",
+      "s3:GetBucketRequestPayment",
+      "s3:GetBucketLogging",
+      "s3:GetReplicationConfiguration",
+      "s3:GetBucketObjectLockConfiguration",
       "s3:ForceDeleteBucket",
     ]
     resources = [
