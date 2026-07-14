@@ -324,7 +324,12 @@ data "aws_iam_policy_document" "deploy_permissions" {
   # are, so all three environments' deploy roles need this identically
   # (missing entirely before this fix - found via a real deploy-role-scoped
   # apply, 2026-07-14, "not authorized to perform:
-  # bedrock-agentcore:CreateWorkloadIdentity").
+  # bedrock-agentcore:CreateWorkloadIdentity"). The actual resource AWS
+  # authorizes CreateWorkloadIdentity against is the sub-resource being
+  # created (.../workload-identity-directory/default/workload-identity/<id>),
+  # not the bare directory ARN - the first fix attempt granted only the
+  # latter and still 403'd on a second real apply, so both patterns are
+  # granted here.
   statement {
     sid    = "AgentCoreWorkloadIdentity"
     effect = "Allow"
@@ -333,7 +338,10 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "bedrock-agentcore:UpdateWorkloadIdentity", "bedrock-agentcore:DeleteWorkloadIdentity",
       "bedrock-agentcore:ListWorkloadIdentities",
     ]
-    resources = ["arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default"]
+    resources = [
+      "arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default",
+      "arn:aws:bedrock-agentcore:${var.aws_region}:${local.account_id}:workload-identity-directory/default/workload-identity/*",
+    ]
   }
 
   statement {
@@ -344,6 +352,10 @@ data "aws_iam_policy_document" "deploy_permissions" {
       "lambda:UpdateFunctionCode", "lambda:UpdateFunctionConfiguration",
       "lambda:AddPermission", "lambda:RemovePermission", "lambda:GetPolicy",
       "lambda:TagResource", "lambda:UntagResource", "lambda:ListTags",
+      # aws_lambda_function's Read always checks the latest published version
+      # via this action, regardless of whether publish = true is set (found
+      # via a real deploy-role-scoped apply, 2026-07-14).
+      "lambda:ListVersionsByFunction",
     ]
     resources = ["arn:aws:lambda:${var.aws_region}:${local.account_id}:function:${var.project}-${each.key}-*"]
   }
