@@ -1098,17 +1098,74 @@ create the IAM role it needs to authenticate) before either workflow can
 do anything beyond `pr-validate.yml`'s no-credentials jobs. See
 `docs/ci_cd_runbook.md` for the exact sequence.
 
+### Progress, 2026-07-14 (new session)
+
+Step 0 and step 1 of the resume plan below are now **done**, live, for real:
+
+- **Repo pushed to GitHub**: `https://github.com/kombaraj-ai/AMC-RFP-Phase3.git`.
+  Local branch renamed `master` → `main` first (matches this doc's/the
+  workflows' assumption), pushed with `-u`, `origin/main` tracking confirmed.
+- **`infra/terraform/github-oidc/` applied to real AWS**: `backend.hcl`
+  (gitignored, bucket `amc-orchestrator-tfstate-766354255780`,
+  key `github-oidc/terraform.tfstate`) and `terraform.tfvars`
+  (`github_org = "kombaraj-ai"`, `github_repo = "AMC-RFP-Phase3"` - tracked
+  in git, no secrets, same convention as the environments' own tfvars)
+  created, `terraform init -backend-config=backend.hcl` +
+  `plan`/`apply` - **9 resources added, 0 errors**. Captured outputs:
+  - `plan_role_arn` = `arn:aws:iam::766354255780:role/amc-orchestrator-gha-plan-role`
+  - `deploy_role_arns.dev` = `arn:aws:iam::766354255780:role/amc-orchestrator-dev-gha-deploy-role`
+  - `deploy_role_arns.staging` = `arn:aws:iam::766354255780:role/amc-orchestrator-staging-gha-deploy-role`
+  - `deploy_role_arns.prod` = `arn:aws:iam::766354255780:role/amc-orchestrator-prod-gha-deploy-role`
+- `environments/dev/terraform.tfvars`'s `additional_data_access_principals`
+  updated to add the `deploy-dev` role ARN alongside the existing human
+  applier ARN (so future CI-triggered dev applies get AOSS data-plane
+  access too) - **edited but not yet applied** (see finding below).
+  `staging`/`prod` tfvars deliberately left with their `[]` placeholders -
+  not their turn yet per the documented Pass 2 rollout order.
+
+**Real, undocumented finding this session: dev is currently torn down to
+zero AWS resources**, and this is *not* the same as the 2026-07-12
+teardown/redeploy already logged above. Confirmed two independent ways:
+`terraform state pull` against the real S3 backend
+(`environments/dev`) shows `"resources": []`, and a direct
+`aws ecr describe-repositories --repository-names amc-orchestrator-dev-agent`
+returns `RepositoryNotFoundException`. `aws s3api list-object-versions` on
+`dev/terraform.tfstate` shows the state shrinking from 192KB to 1.9KB
+across ~10 versions between **2026-07-13 13:58 and 15:49 UTC** - i.e. a
+second, undocumented `terraform destroy` happened on 2026-07-13, the same
+day the Phase 03 CI/CD design/build work landed, and nothing has
+redeployed dev since. Right AWS account confirmed
+(`766354255780`, `user/eks-admin`, matches every prior session). Given
+this, the dev tfvars edit above is a real, correct, but **currently
+inapplicable** change - there's no live dev environment to update, it'll
+take effect whenever dev is next deployed from scratch.
+
+**Not yet committed to git**: `infra/terraform/github-oidc/terraform.tfvars`
+(new, untracked) and `infra/terraform/environments/dev/terraform.tfvars`
+(modified). `docs/i1.png` (a GitHub quick-setup screenshot, used once to
+read the repo URL) is also untracked - safe to delete, not needed by the
+project.
+
 ### Immediate next step (resume here)
 
-1. User pushes the repo to GitHub (their own next step, not done as part
-   of this work).
-2. `docs/ci_cd_runbook.md` step 1: fill in
-   `infra/terraform/github-oidc/terraform.tfvars` with the real
-   `github_org`/`github_repo`, apply it locally, capture
-   `deploy_role_arns`/`plan_role_arn` outputs.
-3. `docs/ci_cd_runbook.md` steps 2-3: create the three GitHub Environments,
-   set the repo-level and per-Environment variables.
-4. Dispatch `deploy.yml` for `dev` first (already-live environment, lowest
-   risk) as the first real end-to-end proof the pipeline works, before
-   attempting staging/prod's first-ever rollout (`docs/ci_cd_runbook.md`
+1. **Decide how to handle dev's teardown** (see finding above) - most
+   likely a fresh 3-pass dev redeploy (pass 1 infra → pass 2
+   `enable_knowledge_base=true` + document ingestion → pass 3
+   `enable_agent_runtime=true` + fresh `docker build`/`push`), which would
+   also be the natural moment to verify the new `deploy-dev` role ARN
+   addition lands correctly. Alternative: leave dev down and let the first
+   `deploy.yml` dispatch (step 4 below) be the one to redeploy it, once CI
+   is wired up - a good real test of the pipeline, but means step 4 is a
+   bigger first test than originally planned (full fresh deploy, not an
+   incremental update).
+2. `docs/ci_cd_runbook.md` steps 2-3: create the three GitHub Environments
+   (`dev`/`staging`/`prod`, restrict deployment branches to `main`), set
+   the repo-level variables (`AWS_PLAN_ROLE_ARN` = the `plan_role_arn`
+   above, `TF_STATE_BUCKET` = `amc-orchestrator-tfstate-766354255780`) and
+   the per-Environment `AWS_DEPLOY_ROLE_ARN` (the matching `deploy_role_arns`
+   entry above, one per Environment).
+3. Dispatch `deploy.yml` for `dev` first (lowest risk - though see item 1,
+   it's now a from-scratch deploy not an incremental one) as the first
+   real end-to-end proof the pipeline works, before attempting staging/prod's
+   first-ever rollout (`docs/ci_cd_runbook.md`
    section 4).

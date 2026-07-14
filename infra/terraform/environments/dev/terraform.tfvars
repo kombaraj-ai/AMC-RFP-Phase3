@@ -45,6 +45,10 @@ runtime_protocol = "HTTP"
 # permissions; without this, vector-index creation fails with an AOSS
 # authorization error. Confirmed via `aws sts get-caller-identity`,
 # 2026-07-12. The deploy-dev role's ARN (infra/terraform/github-oidc's
-# deploy_role_arns["dev"] output) should be added alongside this, additively,
-# once that module is applied - see docs/ci_cd_runbook.md.
-additional_data_access_principals = ["arn:aws:iam::766354255780:user/eks-admin"]
+# deploy_role_arns["dev"] output) is added alongside this, additively, so
+# deploy.yml's CI-triggered dev applies get AOSS access too - added
+# 2026-07-14 once github-oidc was applied - see docs/ci_cd_runbook.md.
+additional_data_access_principals = [
+  "arn:aws:iam::766354255780:user/eks-admin",
+  "arn:aws:iam::766354255780:role/amc-orchestrator-dev-gha-deploy-role",
+]
